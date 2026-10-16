@@ -42,6 +42,8 @@ class Event(NamedTuple):
     loc_source: str | None = None
     # True for "At this place", False for "At this general area" (a ~zoom-12 map tile).
     loc_precise: bool | None = None
+    # The device, when the source records it: "<desktop|phone|tablet|device>: <name>".
+    device: str | None = None
 
     def to_json(self) -> dict:
         return self._asdict() | {"ts": self.ts.isoformat()}

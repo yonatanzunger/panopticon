@@ -133,13 +133,13 @@ def test_load_ids_are_stable_across_ranges(tmp_path):
     ]
     (tmp_path / "My Activity" / "Search" / "MyActivity.json").write_text(json.dumps(rows))
 
-    everything = load(discover([tmp_path]))
+    everything = load(discover([tmp_path])).events
     assert [(e.id, e.text) for e in everything] == [(0, "a"), (1, "b"), (2, "c")]
 
-    subset = load(discover([tmp_path]), since=datetime(2026, 2, 1, tzinfo=UTC))
+    subset = load(discover([tmp_path]), since=datetime(2026, 2, 1, tzinfo=UTC)).events
     assert [(e.id, e.text) for e in subset] == [(1, "b"), (2, "c")]
 
-    subset = load(discover([tmp_path]), until=datetime(2026, 2, 1, tzinfo=UTC))
+    subset = load(discover([tmp_path]), until=datetime(2026, 2, 1, tzinfo=UTC)).events
     assert [(e.id, e.text) for e in subset] == [(0, "a")]
 
 

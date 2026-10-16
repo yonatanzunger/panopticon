@@ -136,10 +136,16 @@ uv run panopticon prepare out/                                        # re-run w
 
 - `-i` / `--input` can be a Takeout root, any folder inside one, or a single file, and can be
   repeated. Every file under it that a reader in `sources/` recognizes is read; the rest are
-  ignored. Today that's `MyActivity.json` (from any product's `My Activity` folder).
-- The inputs and range are recorded in `out/inputs.json`. `run` takes the same flags. Passing
-  any of them replaces the recorded range; leaving out `-i` keeps the recorded inputs. The
-  export files are hashed as inputs, so `run` notices if they change.
+  ignored. Today that's `MyActivity.json` (from any product's `My Activity` folder) and
+  `Chrome/History.json`.
+- `--sources chrome,my_activity` reads only the named sources; `--skip-sources chrome` reads
+  all but those; `--all-sources` goes back to reading everything (the default). Use two output
+  directories to compare a run with and without a source.
+- The inputs, sources, and range are recorded in `out/inputs.json`, and `run` takes the same
+  flags. Each group of flags replaces only its own part of the record: `-i` the inputs, the
+  source flags the sources, and `--since` / `--until` / `--days` the range as a unit
+  (`--all-history` clears it). So `run out/ --skip-sources chrome` keeps the recorded inputs
+  and range. The export files are hashed as inputs, so `run` notices if they change.
 - `--since` / `--until` take an ISO date or datetime (UTC if no zone is given); `--until` is
   exclusive. `--days` counts back from `--until`, or from the newest event in the export, so
   repeated runs on one export select the same events.
@@ -148,6 +154,15 @@ uv run panopticon prepare out/                                        # re-run w
 - To read a new kind of export file, add a module to `sources/` that exports a `SOURCE` (a
   name, a test for which files it reads, and a parser from a file to `Item`s), and list it in
   `sources.SOURCES`. `sources` has JSON and CSV readers.
+- When two sources record the same activity (the same search query, or a visit to the same
+  URL, within 10 minutes), the copy from the source earlier in `sources.SOURCES` is kept, and
+  fills in any fields it lacks from the other (e.g. a Chrome visit's device). Matching is
+  one-to-one, and repeats within a single source are never merged.
+- Each site's boilerplate is stripped from page titles (`boilerplate.py`, no LLM): the site
+  name, the account, the section, as in "Many thoughts - me@gmail.com - Gmail" → "Many
+  thoughts". It's learned per site from the start and end segments that most of the site's
+  titles share. Where a few values compete for that spot instead (two Gmail accounts; Google
+  Docs vs. Sheets), they're signal and are kept. Tuning constants are at the top of the file.
 
 Writes:
 
@@ -329,13 +344,21 @@ uv run panopticon report out/ -o ~/Desktop/my-report.html
   They are sparse: in one sample export, only 2015–2018 and 2026 had any.
 - AI Mode items embed whole conversations; each of the user's follow-up prompts becomes its own
   event, and Google's responses are dropped.
+- **Chrome** history (`Chrome/History.json`) covers about the last year, across every device
+  signed in to Chrome sync. Each visit's `client_id` is a device's `cache_guid` in
+  `Device Information.json`, which gives its form factor and name (`Event.device`); history
+  from a device no longer synced shows as `unknown device`. Google searches in it come out as
+  searches, and ~95% of them are also in My Activity, usually within a second; Google's
+  `/url` redirector hops are dropped. The other Chrome files (bookmarks, reading list,
+  extensions, settings, autofill addresses) aren't read.
 - Timestamps are UTC throughout; localization happens at render time.
 
 ### TODO
 
-- **More Takeout sources.** Chrome history, Timeline, and YouTube, as modules in `sources/`.
-  The same activity can appear both in My Activity and in a product's own export, so these
-  will need de-duplication; Timeline's visits span time rather than being instants.
+- **More Takeout sources.** Timeline and YouTube, as modules in `sources/`. Timeline's visits
+  span time rather than being instants.
+- **Use Chrome's device in the transcript.** `Event.device` is recorded but not yet rendered,
+  so the LLM can't tell phone browsing from desktop.
 - **Home that changes over time.** `features.home` picks one home for the whole range, so on a
   long history every earlier residence is treated as travel (or missed). Infer home per period,
   e.g. the dominant overnight location per month, and let the itinerary solver use it.

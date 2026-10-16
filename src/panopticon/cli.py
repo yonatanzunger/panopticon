@@ -19,6 +19,7 @@ from panopticon import (
     pipeline,
     prepare,
     report,
+    sources,
     summarize,
     synthesize,
     verify,
@@ -32,6 +33,17 @@ def _parse_time(value: str) -> datetime:
     return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
 
 
+def _source_names(value: str) -> list[str]:
+    """A comma-separated list of source names, checked against the known sources."""
+    known = [source.name for source in sources.SOURCES]
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    if unknown := [name for name in names if name not in known]:
+        raise argparse.ArgumentTypeError(
+            f"unknown source(s) {', '.join(unknown)}; known: {', '.join(known)}"
+        )
+    return names
+
+
 def _source_flags(p: argparse.ArgumentParser) -> None:
     """The flags that choose which export `prepare` reads, shared by `prepare` and `run`."""
     p.add_argument(
@@ -40,6 +52,21 @@ def _source_flags(p: argparse.ArgumentParser) -> None:
         type=Path,
         action="append",
         help="a Takeout folder, or a file in one; repeatable (default: those recorded last time)",
+    )
+    known = ", ".join(source.name for source in sources.SOURCES)
+    which = p.add_mutually_exclusive_group()
+    which.add_argument(
+        "--sources",
+        type=_source_names,
+        help=f"read only these sources, comma-separated ({known})",
+    )
+    which.add_argument(
+        "--skip-sources",
+        type=_source_names,
+        help="read every source except these, comma-separated",
+    )
+    which.add_argument(
+        "--all-sources", action="store_true", help="read every source (the default)"
     )
     p.add_argument(
         "--since", type=_parse_time, help="keep events at or after this date/time"
@@ -52,25 +79,46 @@ def _source_flags(p: argparse.ArgumentParser) -> None:
         type=int,
         help="keep only the last N days (before --until, or the export's end)",
     )
+    p.add_argument(
+        "--all-history",
+        action="store_true",
+        help="clear any recorded --since, --until, and --days",
+    )
 
 
 def _update_settings(args: argparse.Namespace) -> prepare.Settings | None:
-    """Record any source flags given, and return the settings now in effect. Giving any flag
-    replaces the recorded range; leaving out --input keeps the recorded inputs."""
+    """Record any source flags given, and return the settings now in effect. Each group of
+    flags replaces only its own part of the recorded settings: --input the inputs; --sources,
+    --skip-sources, or --all-sources the sources; and --since, --until, --days, or
+    --all-history the range, as a unit."""
     settings = prepare.load_settings(args.dir)
-    if (
-        args.input is None
-        and args.since is None
-        and args.until is None
-        and args.days is None
-    ):
+    given_range = args.all_history or any(
+        v is not None for v in (args.since, args.until, args.days)
+    )
+    given_sources = args.all_sources or args.sources or args.skip_sources
+    if args.input is None and not given_range and not given_sources:
         return settings
-    inputs = args.input or (settings.inputs if settings else [])
-    if not inputs:
+    settings = settings or prepare.Settings([])
+    if args.input:
+        settings = settings._replace(inputs=args.input)
+    if not settings.inputs:
         sys.exit(
             "no input recorded for this directory: pass --input with a Takeout folder"
         )
-    settings = prepare.Settings(inputs, args.since, args.until, args.days)
+    if given_range:
+        settings = settings._replace(since=args.since, until=args.until, days=args.days)
+    if args.all_sources:
+        settings = settings._replace(sources=None)
+    elif args.sources:
+        settings = settings._replace(sources=args.sources)
+    elif args.skip_sources:
+        settings = settings._replace(
+            sources=[
+                source.name
+                for source in sources.SOURCES
+                if source.name not in args.skip_sources
+            ]
+        )
     prepare.save_settings(args.dir, settings)
     return prepare.load_settings(args.dir)
 
@@ -87,6 +135,7 @@ def prepare_command(args: argparse.Namespace) -> None:
     print(
         "read "
         + ", ".join(f"{n} {name} file(s)" for name, n in stats.files.most_common())
+        + f"; merged {stats.duplicates} duplicate records of the same activity across sources"
     )
     events = stats.events
     if events:
@@ -438,7 +487,17 @@ def _phase_runners() -> dict[str, Callable[[Path], None]]:
 
     return {
         "prepare": lambda d: prepare_command(
-            ns(dir=d, input=None, since=None, until=None, days=None)
+            ns(
+                dir=d,
+                input=None,
+                sources=None,
+                skip_sources=None,
+                all_sources=False,
+                since=None,
+                until=None,
+                days=None,
+                all_history=False,
+            )
         ),
         "extract": lambda d: extract_command(
             ns(

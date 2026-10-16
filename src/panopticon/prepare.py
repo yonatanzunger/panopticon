@@ -1,8 +1,8 @@
 """Stages 0-2 (local): read a Takeout export into events, compress them into a transcript, and
 compute deterministic features.
 
-Which export to read, and what range of it, is recorded in ``inputs.json`` in the output
-directory. That file is this phase's input, so like every other phase it re-runs when its
+Which export to read, which of its sources, and what range of it, is recorded in
+``inputs.json`` in the output directory. That file is this phase's input, so like every other phase it re-runs when its
 settings, its code, or the export files themselves change.
 """
 
@@ -25,6 +25,8 @@ class Settings(NamedTuple):
     since: datetime | None = None
     until: datetime | None = None
     days: int | None = None
+    # Names of the sources to read (see sources.SOURCES); None reads every source.
+    sources: list[str] | None = None
 
     def to_json(self) -> dict:
         return {
@@ -32,6 +34,7 @@ class Settings(NamedTuple):
             "since": self.since.isoformat() if self.since else None,
             "until": self.until.isoformat() if self.until else None,
             "days": self.days,
+            "sources": self.sources,
         }
 
     @classmethod
@@ -44,6 +47,7 @@ class Settings(NamedTuple):
             ts(data.get("since")),
             ts(data.get("until")),
             data.get("days"),
+            data.get("sources"),
         )
 
 
@@ -66,7 +70,7 @@ def source_files(out: Path) -> list[Path]:
     files: list[Path] = []
     for path in settings.inputs if settings else []:
         if path.exists():
-            files.extend(file for _, file in ingest.discover([path]))
+            files.extend(file for _, file in ingest.discover([path], settings.sources))
         else:
             files.append(path)
     return files
@@ -91,6 +95,7 @@ def select_range(
 
 class Stats(NamedTuple):
     files: Counter[str]  # files read, by source name
+    duplicates: int  # items dropped as another source's copy
     products: Counter[str]  # events in the range, by product
     events: list[Event]
     kept: int
@@ -101,11 +106,9 @@ class Stats(NamedTuple):
 
 def run(settings: Settings, out: Path) -> Stats:
     """Read the export and write events.jsonl, transcript.txt, and features.json to out/."""
-    files = ingest.discover(settings.inputs)
-    events = select_range(
-        ingest.load(files, since=settings.since, until=settings.until),
-        settings.since, settings.until, settings.days,
-    )
+    files = ingest.discover(settings.inputs, settings.sources)
+    loaded = ingest.load(files, since=settings.since, until=settings.until)
+    events = select_range(loaded.events, settings.since, settings.until, settings.days)
     out.mkdir(parents=True, exist_ok=True)
     write_events(events, out / "events.jsonl")
 
@@ -141,6 +144,7 @@ def run(settings: Settings, out: Path) -> Stats:
     )
     return Stats(
         Counter(source.name for source, _ in files),
+        loaded.duplicates,
         Counter(e.product for e in events),
         events, len(kept), len(sessions), len(transcript), home,
     )

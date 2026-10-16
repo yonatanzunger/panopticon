@@ -30,6 +30,7 @@ class Item(NamedTuple):
     lon: float | None
     loc_source: str | None
     loc_precise: bool | None
+    device: str | None = None
 
 
 class Source(NamedTuple):
@@ -52,10 +53,11 @@ def read_csv(path: Path) -> Iterator[dict[str, str]]:
 
 
 # Imported last: the source modules use Item and Source from this module.
-from panopticon.sources import my_activity
+from panopticon.sources import chrome, my_activity
 
-# In priority order: a file goes to the first source that claims it.
-SOURCES: tuple[Source, ...] = (my_activity.SOURCE,)
+# In priority order: a file goes to the first source that claims it, and when two sources
+# record the same activity, ingest keeps the earlier source's copy.
+SOURCES: tuple[Source, ...] = (my_activity.SOURCE, chrome.SOURCE)
 
 
 def claim(path: Path) -> Source | None:
