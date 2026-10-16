@@ -41,8 +41,8 @@ class Phase(NamedTuple):
 # an input so it re-runs once an enricher produces findings.
 PHASES: tuple[Phase, ...] = (
     Phase("prepare",
-          ("prepare.py", "ingest.py", "sources", "boilerplate.py", "events.py", "compress.py",
-           "features.py"),
+          ("prepare.py", "ingest.py", "sources", "boilerplate.py", "apps.py", "events.py",
+           "compress.py", "features.py"),
           (prepare.SETTINGS,),
           ("events.jsonl", "transcript.txt", "features.json"),
           external=prepare.source_files),

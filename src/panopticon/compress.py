@@ -30,6 +30,10 @@ AD_TECH_DOMAINS = frozenset(
 
 # "Used Ads" and the like name the Takeout product, not a real app.
 _NON_APPS = frozenset({"Ads", "Search"})
+# Apps that come to the foreground between other apps, so say nothing the others don't: the
+# home screen (any "... Launcher"), and Android's screen-time tracker.
+_BACKGROUND_APPS = frozenset({"Digital Wellbeing"})
+_YOUTUBE = ("YouTube", "YouTube Music")
 
 SESSION_GAP = timedelta(minutes=30)
 
@@ -60,7 +64,11 @@ def is_noise(event: Event) -> bool:
         # Android deep links into apps; the app itself shows up separately as app use.
         if event.url.startswith("intent:") or event.text.startswith("intent:"):
             return True
-    if event.kind == Kind.APP_USE and event.text in _NON_APPS:
+    if event.kind == Kind.APP_USE and (
+        event.text in _NON_APPS
+        or event.text in _BACKGROUND_APPS
+        or event.text.endswith(" Launcher")
+    ):
         return True
     return False
 
@@ -124,16 +132,32 @@ def clean_url(url: str) -> str:
     return cleaned if len(cleaned) <= MAX_URL else cleaned[: MAX_URL - 1] + "…"
 
 
+# YouTube community posts the user viewed are other people's writing, often long; the channel
+# and the opening carry the signal. (The user's own comments are kept whole.)
+MAX_POST = 120
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Cut at a word boundary, marking the cut."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0] or text[:limit]
+    return cut.rstrip(" ,.;:—-") + "…"
+
+
 def _display(event: Event) -> str:
     if event.text.startswith(("http://", "https://")):
         return clean_url(event.text)
+    if event.kind == Kind.VISIT and event.product in _YOUTUBE:
+        return _shorten(event.text, MAX_POST)
     return event.text
 
 
 def _site(event: Event) -> str:
-    """The site a visit was on, unless the title already is the URL; or a video's channel."""
-    if event.kind == Kind.WATCH:
-        return f" @{event.source}" if event.source else ""
+    """The site a visit was on, unless the title already is the URL. On YouTube, the channel
+    too: "@youtube:<channel>"."""
+    if event.kind == Kind.WATCH or event.product in _YOUTUBE:
+        return f" @youtube:{event.source}" if event.source else " @youtube"
     if event.kind not in (Kind.VISIT, Kind.AD_CLICK) or not event.url:
         return ""
     if event.text.startswith(("http://", "https://")):
@@ -193,7 +217,9 @@ def render(
         #<event id> HH:MM <kind code> <text> [@site] [×count] [[loc lat,lon source]]
     Kind codes: S search (S* = AI Mode), I image search, V visit, $ ad click, A app use,
     P place card, N notifications, W video watched (W* = YouTube Music), C comment posted.
-    Visits show their site after the title, as "<title> @site"; videos their channel.
+    Visits show their site after the title, as "<title> @site"; anything on YouTube shows
+    "@youtube:<channel>". "[on <device>]" ends a line whose device differs from the last
+    device shown in the session.
     """
     out: list[str] = []
     header: tuple[str, str] | None = None
@@ -204,18 +230,32 @@ def render(
             header = (day, str(tz))
             out.append(f"\n## {day} [{tz}]")
         out.append("--")
+        device = None
         for line in session.lines:
-            out.append(format_line(line.event, tz, line.count))
+            shown = line.event.device not in (None, device)
+            out.append(format_line(line.event, tz, line.count, show_device=shown))
+            device = line.event.device or device
     return "\n".join(out).lstrip() + "\n"
 
 
-def format_line(event: Event, tz: tzinfo, count: int = 1, with_date: bool = False) -> str:
+def _device(event: Event) -> str:
+    return f" [on {event.device.replace(': ', ' ')}]" if event.device else ""
+
+
+def format_line(
+    event: Event, tz: tzinfo, count: int = 1, with_date: bool = False,
+    show_device: bool | None = None,
+) -> str:
     """One transcript line. with_date makes it standalone, for showing a line out of context:
         #<id> YYYY-MM-DD Day HH:MM [zone] <kind code> <text> ...
+    A standalone line always shows its device; in a session, render shows it on changes.
     """
+    if show_device is None:
+        show_device = with_date
     local = event.ts.astimezone(tz)
     when = f"{local:%Y-%m-%d %a %H:%M} [{tz}]" if with_date else f"{local:%H:%M}"
     times = f" ×{count}" if count > 1 else ""
     return (
         f"#{event.id} {when} {_code(event)} {_display(event)}{_site(event)}{times}{_loc(event)}"
+        + (_device(event) if show_device else "")
     )

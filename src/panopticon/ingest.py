@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
 
-from panopticon import boilerplate, sources
+from panopticon import apps, boilerplate, sources
 from panopticon.events import Event, Kind
 from panopticon.sources import Item, Source
 
@@ -151,7 +151,7 @@ def load(
     items, duplicates = merge_duplicates(
         [streams[k] for k in sorted(streams, key=lambda k: (_product_rank(k[1]), order[k[0]]))]
     )
-    items = boilerplate.strip_items(items)
+    items = apps.rename(boilerplate.strip_items(items))
     # Sorting is stable, so AI Mode follow-ups sharing a timestamp keep their order.
     items.sort(key=lambda item: item.ts)
     events = [

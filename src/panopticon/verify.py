@@ -69,8 +69,9 @@ cited the history lines it rests on. You see only that claim and those lines. Ju
 skeptically, what the lines alone support.
 
 Line format: "#<id> <local date and time> [zone] <kind> <text>", optionally followed by \
-"@site" (the site of a visit, or the channel of a video), "×N" (repeated N times in a session), and "[loc LAT,LON \
-SOURCE]" (where Google recorded the user as being). Kinds: S search, S* AI Mode prompt, \
+"@site" (the site of a visit; for anything on YouTube, "@youtube:<channel>"), "×N" (repeated N times in a session), and "[loc LAT,LON \
+SOURCE]" (where Google recorded the user as being), and "[on DEVICE]" (the device it happened on, \
+when recorded). Kinds: S search, S* AI Mode prompt, \
 I image search, V page visit, $ ad click, A app use, P place or business card viewed, \
 N notifications, W YouTube video watched, W* YouTube Music track played, C comment or live \
 chat message the user posted on YouTube.

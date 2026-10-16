@@ -37,7 +37,7 @@ def test_watch_rows():
     (music,) = parse_row(watch("Watched A Song", "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
                                header="YouTube Music"))
     assert (music.product, music.url) == ("YouTube Music", VIDEO)
-    assert format_line(Event(1, *music), UTC) == "#1 12:00 W* A Song @Some Channel"
+    assert format_line(Event(1, *music), UTC) == "#1 12:00 W* A Song @youtube:Some Channel"
 
 
 def test_viewed_in_youtube_is_a_post_not_a_place():

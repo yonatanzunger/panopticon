@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 
 from panopticon import (
+    apps,
     compress,
     enrich,
     extract,
@@ -572,9 +573,11 @@ def events_command(args: argparse.Namespace) -> None:
             day = local.date()
             print(f"\n## {local:%Y-%m-%d %a} [{tz}]")
         fields = [e.text]
-        if e.url:
+        if pkg := apps.package(e.url):
+            fields.append(f"app={pkg}")
+        elif e.url:
             fields.append(e.url)
-        if e.source:
+        if e.source and e.source != e.text:
             fields.append(f"source={e.source}")
         if e.device:
             fields.append(f"device={e.device}")

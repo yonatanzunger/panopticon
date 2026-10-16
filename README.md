@@ -363,10 +363,19 @@ uv run panopticon report out/ -o ~/Desktop/my-report.html
   searches, and ~95% of them are also in My Activity, usually within a second; Google's
   `/url` redirector hops are dropped. The other Chrome files (bookmarks, reading list,
   extensions, settings, autofill addresses) aren't read.
+- **Devices** (from Chrome sync, and carried onto any record merged with a Chrome one) show in
+  the transcript as `[on phone Pixel 9 Pro]`, only where a session switches device. The home
+  screen ("... Launcher") and Digital Wellbeing are noise: they come up between other apps.
+- **App use** ("Used <app>") is recorded by Google Play Store, Ads, Google Analytics, Android,
+  and others. Records that link to the app's Play Store page carry its package id, so
+  `apps.py` gives each app one short name, cutting the store listing's tagline
+  ("DoorDash: Food, Grocery, More" → "DoorDash"), and uses it everywhere that app appears.
 - **YouTube** watch and search history (`YouTube and YouTube Music/history/`) are My
   Activity rows, the same as `My Activity/YouTube`; if both are exported they merge almost
-  entirely. Watches are `W` lines (`W*` for YouTube Music) with the channel as `@channel`;
-  "Viewed" in YouTube is a community post, not a place card. Comments and live chats are `C`
+  entirely. Watches are `W` lines (`W*` for YouTube Music); everything on YouTube is tagged
+  `@youtube:<channel>`;
+  "Viewed" in YouTube is a community post, not a place card; the transcript shows only
+  its first 120 characters (`compress.MAX_POST`), since it's someone else's writing. Comments and live chats are `C`
   lines: the user's own words, with the video's title when the watch history has it.
   Subscriptions, playlists, and the user's uploads aren't read.
 - Timestamps are UTC throughout; localization happens at render time.

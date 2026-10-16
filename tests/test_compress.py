@@ -90,3 +90,52 @@ def test_render_localizes_and_labels():
         "#10 13:03 V https://x.example/",
         "#11 13:04 S uv index [loc -12.12,-77.03 device]",
     ]
+
+
+def test_device_shown_on_change_and_youtube_channel():
+    from datetime import UTC, datetime, timedelta
+
+    from panopticon.compress import is_noise, render, sessionize
+    from panopticon.events import Event, Kind
+
+    t = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+
+    def ev(i, kind, text, product="Chrome", device=None, url=None, source=None):
+        return Event(i, t + timedelta(minutes=i), product, kind, text, url, source, None, None,
+                     device=device)
+
+    events = [
+        ev(1, Kind.VISIT, "A page", device="desktop: ember", url="https://a.example/"),
+        ev(2, Kind.SEARCH, "q", product="Search"),
+        ev(3, Kind.VISIT, "B page", device="desktop: ember", url="https://b.example/"),
+        ev(4, Kind.VISIT, "A post", product="YouTube", device="phone: Pixel",
+           url="https://www.youtube.com/post/Ugkx1", source="Chan"),
+        ev(5, Kind.WATCH, "Vid", product="Chrome", url="https://www.youtube.com/watch?v=x"),
+    ]
+    lines = render(sessionize(events)).splitlines()[2:]
+    assert lines == [
+        "#1 12:01 V A page @a.example [on desktop ember]",
+        "#2 12:02 S q",
+        "#3 12:03 V B page @b.example",
+        "#4 12:04 V A post @youtube:Chan [on phone Pixel]",
+        "#5 12:05 W Vid @youtube",
+    ]
+    assert is_noise(ev(6, Kind.APP_USE, "Pixel Launcher", product="Google Play Store"))
+    assert is_noise(ev(7, Kind.APP_USE, "Digital Wellbeing", product="Android"))
+    assert not is_noise(ev(8, Kind.APP_USE, "DoorDash", product="Google Play Store"))
+
+
+def test_youtube_posts_are_shortened_but_comments_are_not():
+    from datetime import UTC, datetime
+
+    from panopticon.compress import MAX_POST, format_line
+    from panopticon.events import Event, Kind
+
+    long = "word " * 60
+    t = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+    post = Event(1, t, "YouTube", Kind.VISIT, long.strip(), None, "Chan", None, None)
+    line = format_line(post, UTC)
+    assert line.endswith("word… @youtube:Chan")
+    assert len(line) < MAX_POST + 40
+    comment = post._replace(kind=Kind.COMMENT)
+    assert long.strip() in format_line(comment, UTC)
