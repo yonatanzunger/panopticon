@@ -200,8 +200,17 @@ def render(
             out.append(f"\n## {day} [{tz}]")
         out.append("--")
         for line in session.lines:
-            e = line.event
-            local = e.ts.astimezone(tz).strftime("%H:%M")
-            count = f" ×{line.count}" if line.count > 1 else ""
-            out.append(f"#{e.id} {local} {_code(e)} {_display(e)}{_site(e)}{count}{_loc(e)}")
+            out.append(format_line(line.event, tz, line.count))
     return "\n".join(out).lstrip() + "\n"
+
+
+def format_line(event: Event, tz: tzinfo, count: int = 1, with_date: bool = False) -> str:
+    """One transcript line. with_date makes it standalone, for showing a line out of context:
+        #<id> YYYY-MM-DD Day HH:MM [zone] <kind code> <text> ...
+    """
+    local = event.ts.astimezone(tz)
+    when = f"{local:%Y-%m-%d %a %H:%M} [{tz}]" if with_date else f"{local:%H:%M}"
+    times = f" ×{count}" if count > 1 else ""
+    return (
+        f"#{event.id} {when} {_code(event)} {_display(event)}{_site(event)}{times}{_loc(event)}"
+    )

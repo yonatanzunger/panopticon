@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,7 +9,9 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
-from panopticon import compress, extract, features, ingest, itinerary, synthesize
+from panopticon import (
+    compress, extract, features, ingest, itinerary, report, summarize, synthesize, verify,
+)
 from panopticon.events import Event, Kind, read_events, write_events
 
 
@@ -243,6 +246,102 @@ def synthesize_command(args: argparse.Namespace) -> None:
         print(f"  {unresolved} claim(s) cite no evidence that exists", file=sys.stderr)
 
 
+def _localizer(out: Path, home: features.Home | None) -> tuple[itinerary.Localizer, list[dict]]:
+    """The itinerary's localizer and its trips, or home-zone times and no trips."""
+    default_tz = home.tz if home else "UTC"
+    segments = report.load_json(out / "itinerary.json")
+    if not isinstance(segments, list):
+        return itinerary.Localizer([], default=default_tz), []
+    return (
+        itinerary.Localizer.from_json(segments, default=default_tz),
+        [s for s in segments if not s["is_home"]],
+    )
+
+
+def verify_command(args: argparse.Namespace) -> None:
+    events, home = load_prepared(args.dir)
+    profile = report.load_json(args.dir / "profile.json")
+    if not isinstance(profile, dict):
+        sys.exit(f"no {args.dir / 'profile.json'}: run `synthesize` first")
+    tz_at, _ = _localizer(args.dir, home)
+    claims = profile["claims"]
+    by_id = {e.id: e for e in events}
+    activity = synthesize.activity_block(events, tz_at)
+    prompts = [verify.claim_prompt(c, by_id, tz_at, activity) for c in claims]
+    chars = sum(len(p) for p in prompts) + len(prompts) * len(verify.SYSTEM_PROMPT)
+    _estimate(args.model, chars, len(prompts), out_per_request=2_000)
+
+    if args.dry_run:
+        (args.dir / "verify_prompts.txt").write_text(
+            "\n\n=====\n\n".join(prompts), encoding="utf8"
+        )
+        print(f"dry run: wrote the exact prompts to {args.dir / 'verify_prompts.txt'}; "
+              "nothing sent")
+        return
+
+    verified, results = _call_api(
+        lambda: verify.run(claims, events, tz_at, args.model, args.effort, args.concurrency,
+                           activity)
+    )
+    verify.write(profile["summary"], verified, results, args.dir)
+    statuses = Counter(c["status"] for c in verified)
+    print(f"{len(verified)} claims: " + ", ".join(f"{n} {s}" for s, n in statuses.most_common())
+          + f"; written to {args.dir / 'verified.json'}")
+
+
+def summarize_command(args: argparse.Namespace) -> None:
+    verified = report.load_json(args.dir / "verified.json")
+    if not isinstance(verified, dict):
+        sys.exit(f"no {args.dir / 'verified.json'}: run `verify` first")
+    _, home = load_prepared(args.dir)
+    _, trips = _localizer(args.dir, home)
+    prompt = summarize.build_prompt(verified["claims"], trips)
+    _estimate(args.model, len(prompt) + len(summarize.SYSTEM_PROMPT), 1, out_per_request=3_000)
+    if args.dry_run:
+        (args.dir / "summarize_prompt.txt").write_text(prompt, encoding="utf8")
+        print(f"dry run: wrote the exact prompt to {args.dir / 'summarize_prompt.txt'}; "
+              "nothing sent")
+        return
+    result = _call_api(lambda: summarize.run(prompt, args.model, args.effort))
+    if not result.summary:
+        sys.exit(f"summary stopped with stop_reason={result.stop_reason}; nothing written")
+    summarize.write(result, args.dir)
+    print(f"wrote {args.dir / 'summary.json'}")
+
+
+def report_command(args: argparse.Namespace) -> None:
+    events, home = load_prepared(args.dir)
+    tz_at, trips = _localizer(args.dir, home)
+    verified = report.load_json(args.dir / "verified.json")
+    profile = report.load_json(args.dir / "profile.json")
+    if isinstance(verified, dict):
+        source = verified
+    elif isinstance(profile, dict):
+        print("no verified.json: reporting unverified claims (run `verify` first)",
+              file=sys.stderr)
+        source = profile
+    else:
+        sys.exit(f"no profile in {args.dir}: run `synthesize` (and `verify`) first")
+
+    extract_log = (
+        _read_jsonl(args.dir / "extract_log.jsonl")
+        if (args.dir / "extract_log.jsonl").exists() else None
+    )
+    final = report.load_json(args.dir / "summary.json")
+    summary_is_final = isinstance(final, dict) and isinstance(verified, dict)
+    if isinstance(verified, dict) and not summary_is_final:
+        print("no summary.json: showing synthesis's pre-verification draft summary "
+              "(run `summarize`)", file=sys.stderr)
+    usage = report.api_usage({"extract": extract_log, "synthesize": profile, "verify": verified,
+                              "summarize": final})
+    html = report.render(final["summary"] if summary_is_final else source["summary"],
+                         source["claims"], trips, events, tz_at, home.tz if home else "UTC",
+                         usage, summary_is_final)
+    path = args.output or args.dir / "report.html"
+    path.write_text(html, encoding="utf8")
+    print(f"wrote {path} ({len(html) / 1000:,.0f} kB); it loads nothing from the network")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("panopticon")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -295,6 +394,39 @@ def main() -> None:
         help="write the exact prompt that would be sent, and estimate cost; send nothing",
     )
 
+    p = subparsers.add_parser(
+        "verify", help="stage 6: check each claim against only its cited lines, with Claude"
+    )
+    p.add_argument("dir", type=Path, help="an output directory with a `synthesize` profile")
+    p.add_argument("--model", default=verify.DEFAULT_MODEL)
+    p.add_argument(
+        "--effort", default=verify.DEFAULT_EFFORT,
+        choices=["low", "medium", "high", "xhigh", "max"],
+    )
+    p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="write the exact prompts that would be sent, and estimate cost; send nothing",
+    )
+
+    p = subparsers.add_parser(
+        "summarize", help="write the final summary from the verified claims, with Claude"
+    )
+    p.add_argument("dir", type=Path, help="an output directory with `verify` output")
+    p.add_argument("--model", default=summarize.DEFAULT_MODEL)
+    p.add_argument(
+        "--effort", default=summarize.DEFAULT_EFFORT,
+        choices=["low", "medium", "high", "xhigh", "max"],
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="write the exact prompt that would be sent, and estimate cost; send nothing",
+    )
+
+    p = subparsers.add_parser("report", help="write a self-contained HTML report (local)")
+    p.add_argument("dir", type=Path, help="an output directory with a profile")
+    p.add_argument("-o", "--output", type=Path, help="where to write it (default: DIR/report.html)")
+
     args = parser.parse_args()
     if args.command == "prepare":
         events = ingest.load(args.inputs, since=args.since, until=args.until)
@@ -305,3 +437,9 @@ def main() -> None:
         itinerary_command(args)
     elif args.command == "synthesize":
         synthesize_command(args)
+    elif args.command == "verify":
+        verify_command(args)
+    elif args.command == "summarize":
+        summarize_command(args)
+    elif args.command == "report":
+        report_command(args)

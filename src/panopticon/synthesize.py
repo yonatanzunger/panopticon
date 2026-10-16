@@ -18,7 +18,8 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field
 
 from panopticon.events import Event, Kind
-from panopticon.extract import _FALLBACK_BETA, Category, Sensitivity
+from panopticon import llm
+from panopticon.extract import Category, Sensitivity
 from panopticon.features import Home
 from panopticon.progress import Progress
 
@@ -100,6 +101,41 @@ def _local_day(ts: datetime, tz_at: Callable[[datetime], tzinfo]) -> str:
     return ts.astimezone(tz_at(ts)).strftime("%Y-%m-%d")
 
 
+def activity_block(events: list[Event], tz_at: Callable[[datetime], tzinfo]) -> str:
+    """Statistics computed over every event in the range, not a sample: kinds, hours, top apps
+    (with monthly counts for the top ten, so claims about when habits happened can be checked),
+    and top sites."""
+    lines = ["<activity>"]
+    if events:
+        lines.append(f"range: {_local_day(events[0].ts, tz_at)} to "
+                     f"{_local_day(events[-1].ts, tz_at)}, {len(events)} events")
+        kinds = Counter(e.kind.value for e in events)
+        lines.append("events by kind: " + ", ".join(f"{k} {n}" for k, n in kinds.most_common()))
+        hours = Counter(e.ts.astimezone(tz_at(e.ts)).hour for e in events)
+        lines.append("events by local hour 0-23: " + " ".join(str(hours[h]) for h in range(24)))
+        apps = Counter(e.text for e in events if e.kind == Kind.APP_USE)
+        lines.append("most used apps: " + "; ".join(f"{a} ({n})" for a, n in apps.most_common(25)))
+        months = sorted({e.ts.astimezone(tz_at(e.ts)).strftime("%Y-%m") for e in events})
+        for app, _ in apps.most_common(10):
+            by_month = Counter(
+                e.ts.astimezone(tz_at(e.ts)).strftime("%Y-%m")
+                for e in events
+                if e.kind == Kind.APP_USE and e.text == app
+            )
+            lines.append(f"  {app} by month: "
+                         + ", ".join(f"{m} {by_month[m]}" for m in months))
+        sites = Counter(
+            (urlparse(e.url).hostname or "").removeprefix("www.")
+            for e in events
+            if e.kind == Kind.VISIT and e.url
+        )
+        lines.append("most visited sites: " + "; ".join(
+            f"{s} ({n})" for s, n in sites.most_common(40) if s
+        ))
+    lines.append("</activity>")
+    return "\n".join(lines)
+
+
 def build_inputs(
     facts: list[dict],
     trips: list[dict],
@@ -119,25 +155,7 @@ def build_inputs(
         lines.append(f"T{i} {trip['start'][:10]} to {trip['end'][:10]}: {trip['place']}")
     lines.append("</itinerary>\n")
 
-    lines.append("<activity>")
-    if events:
-        lines.append(f"range: {_local_day(events[0].ts, tz_at)} to "
-                     f"{_local_day(events[-1].ts, tz_at)}, {len(events)} events")
-        kinds = Counter(e.kind.value for e in events)
-        lines.append("events by kind: " + ", ".join(f"{k} {n}" for k, n in kinds.most_common()))
-        hours = Counter(e.ts.astimezone(tz_at(e.ts)).hour for e in events)
-        lines.append("events by local hour 0-23: " + " ".join(str(hours[h]) for h in range(24)))
-        apps = Counter(e.text for e in events if e.kind == Kind.APP_USE)
-        lines.append("most used apps: " + "; ".join(f"{a} ({n})" for a, n in apps.most_common(25)))
-        sites = Counter(
-            (urlparse(e.url).hostname or "").removeprefix("www.")
-            for e in events
-            if e.kind == Kind.VISIT and e.url
-        )
-        lines.append("most visited sites: " + "; ".join(
-            f"{s} ({n})" for s, n in sites.most_common(40) if s
-        ))
-    lines.append("</activity>\n")
+    lines.append(activity_block(events, tz_at) + "\n")
 
     lines.append("<facts>")
     for fact in facts:
@@ -212,34 +230,20 @@ def run(
     client = anthropic.Anthropic()
     with Progress("synthesize", total=1) as progress:
         progress.start(0, "profile")
-        with client.beta.messages.stream(
-            model=model,
-            max_tokens=64_000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": inputs.text}],
-            output_config={"effort": effort},
-            output_format=Profile,
-            betas=[_FALLBACK_BETA],
-            fallbacks="default",
-        ) as stream:
-            received = 0
-            for text in stream.text_stream:
-                received += len(text)
-                progress.update(0, received)
-            message = stream.get_final_message()
-        usage = {
-            "input_tokens": message.usage.input_tokens,
-            "output_tokens": message.usage.output_tokens,
-        }
-        profile = message.parsed_output
+        result = llm.call(
+            client, model=model, effort=effort, system=SYSTEM_PROMPT, prompt=inputs.text,
+            output_format=Profile, on_output=lambda chars: progress.update(0, chars),
+        )
+        usage = result.usage
+        profile = result.parsed
         n_claims = len(profile.claims) if profile else 0
-        progress.finish(0, f"{n_claims} claims, stop={message.stop_reason}, "
+        progress.finish(0, f"{n_claims} claims, stop={result.stop_reason}, "
                            f"in={usage['input_tokens']:,} out={usage['output_tokens']:,} tokens")
 
-    if profile is None or message.stop_reason in ("refusal", "max_tokens"):
-        return SynthesisResult("", [], message.stop_reason, message.model, usage)
+    if profile is None:
+        return SynthesisResult("", [], result.stop_reason, result.model, usage)
     claims = resolve(profile, inputs, facts, trips, events, tz_at)
-    return SynthesisResult(profile.summary, claims, message.stop_reason, message.model, usage)
+    return SynthesisResult(profile.summary, claims, result.stop_reason, result.model, usage)
 
 
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}

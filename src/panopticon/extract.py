@@ -15,6 +15,7 @@ from typing import Literal, NamedTuple
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field
 
+from panopticon import llm
 from panopticon.compress import Session, render
 from panopticon.features import Home, timezone_at
 from panopticon.progress import Progress
@@ -24,7 +25,6 @@ DEFAULT_EFFORT = "medium"
 # Roughly 60k tokens of transcript per request: big enough to see a whole trip in context,
 # small enough to leave the model room to be thorough.
 DEFAULT_CHUNK_CHARS = 240_000
-_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 Strength = Literal["strong", "moderate", "weak"]
 
@@ -275,32 +275,15 @@ def extract_chunk(
 ) -> ChunkResult:
     """Extract place and fact evidence from one chunk. on_output, if given, is called with the
     number of output characters received so far as the response streams in."""
-    with client.beta.messages.stream(
-        model=model,
-        max_tokens=64_000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt(chunk, home)}],
-        output_config={"effort": effort},
-        output_format=Extraction,
-        betas=[_FALLBACK_BETA],
-        fallbacks="default",
-    ) as stream:
-        received = 0
-        for text in stream.text_stream:
-            received += len(text)
-            if on_output:
-                on_output(received)
-        message = stream.get_final_message()
-
-    usage = {
-        "input_tokens": message.usage.input_tokens,
-        "output_tokens": message.usage.output_tokens,
-    }
-    if message.stop_reason in ("refusal", "max_tokens") or message.parsed_output is None:
-        return ChunkResult(chunk.index, [], [], message.stop_reason, message.model, usage, 0)
-    places, facts, dropped = validate(message.parsed_output, chunk)
+    result = llm.call(
+        client, model=model, effort=effort, system=SYSTEM_PROMPT,
+        prompt=user_prompt(chunk, home), output_format=Extraction, on_output=on_output,
+    )
+    if result.parsed is None:
+        return ChunkResult(chunk.index, [], [], result.stop_reason, result.model, result.usage, 0)
+    places, facts, dropped = validate(result.parsed, chunk)
     return ChunkResult(
-        chunk.index, places, facts, message.stop_reason, message.model, usage, dropped
+        chunk.index, places, facts, result.stop_reason, result.model, result.usage, dropped
     )
 
 
