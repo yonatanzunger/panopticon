@@ -21,6 +21,7 @@ from panopticon.compress import format_line
 from panopticon.events import Event
 from panopticon import llm
 from panopticon.extract import Sensitivity
+from panopticon.model import Claim
 from panopticon.progress import Progress
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -105,26 +106,26 @@ class ClaimResult(NamedTuple):
 
 
 def claim_prompt(
-    claim: dict,
+    claim: Claim,
     events: dict[int, Event],
     tz_at: Callable[[datetime], tzinfo],
     activity: str = "",
 ) -> str:
     """The claim, its cited lines, and (if given) the activity statistics for the whole range."""
-    cited = [events[i] for i in claim["event_ids"] if i in events]
+    cited = [events[i] for i in claim.event_ids if i in events]
     cited.sort(key=lambda e: e.ts)
     shown = cited[:MAX_LINES]
     lines = [format_line(e, tz_at(e.ts), with_date=True) for e in shown]
     if len(cited) > len(shown):
         lines.append(f"({len(cited) - len(shown)} more cited lines not shown)")
-    alternatives = "; ".join(claim["alternatives"]) or "none listed"
+    alternatives = "; ".join(claim.alternatives) or "none listed"
     return (
         "<claim>\n"
-        f"Claim: {claim['claim']}\n"
-        f"Category: {claim['category']}\n"
-        f"Stated confidence: {claim['confidence']}\n"
-        f"About: {claim['about']}\n"
-        f"How the earlier stage says the evidence fits: {claim['detail']}\n"
+        f"Claim: {claim.claim}\n"
+        f"Category: {claim.category}\n"
+        f"Stated confidence: {claim.confidence}\n"
+        f"About: {claim.about}\n"
+        f"How the earlier stage says the evidence fits: {claim.detail}\n"
         f"Alternatives it considered: {alternatives}\n"
         "</claim>\n\n"
         "<lines>\n" + "\n".join(lines) + "\n</lines>"
@@ -155,56 +156,54 @@ def verify_claim(
     return ClaimResult(index, verification, result.stop_reason, result.model, result.usage)
 
 
-def apply(claim: dict, verification: dict | None) -> dict:
+def apply(claim: Claim, verification: dict | None) -> Claim:
     """Merge a verification into its claim, deciding the claim's final form:
     kept (supported), revised (partially supported), unconfirmed (unsupported by the cited lines
     alone; evidence elsewhere may still make it a reasonable guess), or unverified
     (the verifier returned nothing usable, e.g. a refusal; the claim stands as synthesized)."""
     if verification is None:
-        return claim | {"verification": None, "status": "unverified",
-                        "final_claim": claim["claim"], "final_confidence": claim["confidence"],
-                        "final_about": claim["about"], "final_sensitivity": claim["sensitivity"]}
+        return claim.model_copy(update={"status": "unverified", "verification": None})
     status = {"supported": "kept", "partially_supported": "revised",
               "unsupported": "unconfirmed"}[verification["verdict"]]
     final_claim = (
         verification["revised_claim"]
         if status == "revised" and verification["revised_claim"]
-        else claim["claim"]
+        else claim.claim
     )
     if status == "kept" and (
-        verification["confidence"] != claim["confidence"]
-        or verification["about"] != claim["about"]
+        verification["confidence"] != claim.confidence
+        or verification["about"] != claim.about
     ):
         status = "revised"
-    return claim | {
+    return claim.model_copy(update={
         "verification": verification,
         "status": status,
         "final_claim": final_claim,
         "final_confidence": verification["confidence"],
         "final_about": verification["about"],
         "final_sensitivity": sorted(set(verification["sensitivity"])),
-    }
+    })
 
 
 def run(
-    claims: list[dict],
+    claims: list[Claim],
     events: list[Event],
     tz_at: Callable[[datetime], tzinfo],
     model: str = DEFAULT_MODEL,
     effort: str = DEFAULT_EFFORT,
     concurrency: int = 8,
     activity: str = "",
-) -> tuple[list[dict], list[ClaimResult]]:
+) -> tuple[list[Claim], list[ClaimResult]]:
     client = anthropic.Anthropic()
     by_id = {e.id: e for e in events}
 
     def one(index: int) -> ClaimResult:
         claim = claims[index]
-        label = f"claim {index} ({claim['category']})"
+        label = f"claim {index} ({claim.category})"
         progress.start(index, label)
         result = verify_claim(
             client, index, claim_prompt(claim, by_id, tz_at, activity),
-            frozenset(claim["event_ids"]), model, effort,
+            frozenset(claim.event_ids), model, effort,
             on_output=lambda chars: progress.update(index, chars),
         )
         verdict = result.verification["verdict"] if result.verification else "none"
@@ -221,7 +220,7 @@ def run(
 
 
 def write(
-    summary: str, verified: list[dict], results: list[ClaimResult], out: Path
+    summary: str, verified: list[Claim], results: list[ClaimResult], out: Path
 ) -> None:
     usage = {
         "input_tokens": sum(r.usage["input_tokens"] for r in results),
@@ -230,7 +229,7 @@ def write(
     log = [{"claim": r.index, "stop_reason": r.stop_reason, "model": r.model,
             "usage": r.usage} for r in results]
     (out / "verified.json").write_text(
-        json.dumps({"summary": summary, "claims": verified, "usage": usage, "log": log},
-                   indent=2, ensure_ascii=False),
+        json.dumps({"summary": summary, "claims": [c.to_verified_dict() for c in verified],
+                    "usage": usage, "log": log}, indent=2, ensure_ascii=False),
         encoding="utf8",
     )

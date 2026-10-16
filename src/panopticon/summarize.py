@@ -13,6 +13,7 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field
 
 from panopticon import llm
+from panopticon.model import Claim, Trip
 from panopticon.progress import Progress
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -50,19 +51,17 @@ its stated confidence.
 """
 
 
-def build_prompt(claims: list[dict], trips: list[dict]) -> str:
+def build_prompt(claims: list[Claim], trips: list[Trip]) -> str:
     lines = ["<claims>"]
     for i, c in enumerate(claims):
-        status = "unconfirmed" if c.get("status") == "dropped" else c.get("status", "unverified")
-        sensitive = ", ".join(c.get("final_sensitivity", c["sensitivity"])) or "none"
+        sensitive = ", ".join(c.final_sensitivity or []) or "none"
         lines.append(
-            f"C{i} [{status}; {c.get('final_confidence', c['confidence'])} confidence; "
-            f"about {c.get('final_about', c['about'])}; {c['category']}; sensitive: {sensitive}] "
-            f"{c.get('final_claim', c['claim'])}"
+            f"C{i} [{c.status}; {c.final_confidence} confidence; "
+            f"about {c.final_about}; {c.category}; sensitive: {sensitive}] {c.final_claim}"
         )
     lines.append("</claims>\n\n<trips>")
     for t in trips:
-        lines.append(f"{t['start'][:10]} to {t['end'][:10]}: {t['place']}")
+        lines.append(f"{t.start[:10]} to {t.end[:10]}: {t.place}")
     lines.append("</trips>")
     return "\n".join(lines)
 

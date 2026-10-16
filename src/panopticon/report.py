@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from panopticon.compress import format_line
 from panopticon.events import Event
+from panopticon.model import Claim, Trip
 
 _STATUS = {
     # status: (label, icon, css class)
@@ -34,12 +35,6 @@ _SENSITIVITY_LABELS = {
     "children": "Children",
     "immigration_status": "Immigration status",
 }
-
-
-def _status(claim: dict) -> str:
-    # "dropped" is what verification called unconfirmed claims before the rename.
-    status = claim.get("status", "unverified")
-    return "unconfirmed" if status == "dropped" else status
 
 
 def _title(slug: str) -> str:
@@ -190,7 +185,7 @@ SCRIPT = """
 """
 
 
-def _timeline_svg(trips: list[dict], start: datetime, end: datetime, tz: tzinfo) -> str:
+def _timeline_svg(trips: list[Trip], start: datetime, end: datetime, tz: tzinfo) -> str:
     """Trips as bars on one time axis, labels staggered into rows so they never overlap."""
     width, pad, row_h, axis_h = 920, 12, 34, 28
     span = max((end - start).total_seconds(), 1.0)
@@ -200,12 +195,11 @@ def _timeline_svg(trips: list[dict], start: datetime, end: datetime, tz: tzinfo)
 
     # (trip, bar start, bar end, label start, row). A label starts at its bar unless that
     # would run it off the right edge, in which case it ends at the edge instead.
-    placed: list[tuple[dict, float, float, float, int]] = []
+    placed: list[tuple[Trip, float, float, float, int]] = []
     row_ends: list[float] = []
     for trip in trips:
-        s, e = datetime.fromisoformat(trip["start"]), datetime.fromisoformat(trip["end"])
-        x0, x1 = x(s), max(x(e), x(s) + 3)
-        label_w = 7 * len(trip["place"])
+        x0, x1 = x(trip.start_dt), max(x(trip.end_dt), x(trip.start_dt) + 3)
+        label_w = 7 * len(trip.place)
         lx = min(x0, width - pad - label_w)
         left, right = min(x0, lx), max(x1, lx + label_w + 8)
         row = next((r for r, last in enumerate(row_ends) if last < left), len(row_ends))
@@ -234,15 +228,14 @@ def _timeline_svg(trips: list[dict], start: datetime, end: datetime, tz: tzinfo)
         month = month.replace(year=month.year + month.month // 12, month=month.month % 12 + 1)
     for trip, x0, x1, lx, row in placed:
         y = row * row_h + 18
-        s, e = datetime.fromisoformat(trip["start"]), datetime.fromisoformat(trip["end"])
-        zone = ZoneInfo(trip["tz"])
-        tip = f"{trip['place']}: {_span(s, e, zone)} ({_duration(s, e)})"
+        tip = (f"{trip.place}: {_span(trip.start_dt, trip.end_dt, trip.zone)} "
+               f"({_duration(trip.start_dt, trip.end_dt)})")
         parts.append(
             f'<g class="trip"><title>{escape(tip)}</title>'
             f'<rect class="bar" x="{x0:.1f}" y="{y}" width="{x1 - x0:.1f}" height="10" rx="3"/>'
-            f'<text x="{lx:.1f}" y="{y - 5}">{escape(trip["place"])}</text>'
+            f'<text x="{lx:.1f}" y="{y - 5}">{escape(trip.place)}</text>'
             f'<rect class="hit" x="{min(x0, lx) - 4:.1f}" y="{y - 18}" '
-            f'width="{max(x1, lx + 7 * len(trip["place"])) - min(x0, lx) + 8:.1f}" '
+            f'width="{max(x1, lx + 7 * len(trip.place)) - min(x0, lx) + 8:.1f}" '
             f'height="32"/></g>'
         )
     parts.append("</svg>")
@@ -250,15 +243,15 @@ def _timeline_svg(trips: list[dict], start: datetime, end: datetime, tz: tzinfo)
 
 
 def _claim_card(
-    claim: dict, events: dict[int, Event], tz_at: Callable[[datetime], tzinfo], anchor: str
+    claim: Claim, events: dict[int, Event], tz_at: Callable[[datetime], tzinfo], anchor: str
 ) -> str:
-    status = _status(claim)
+    status = claim.status
     label, icon, cls = _STATUS[status]
-    verification = claim.get("verification") or {}
-    confidence = claim.get("final_confidence", claim["confidence"])
-    about = claim.get("final_about", claim["about"])
-    sensitivity = claim.get("final_sensitivity", claim["sensitivity"])
-    text = claim.get("final_claim", claim["claim"])
+    verification = claim.verification or {}
+    confidence = claim.final_confidence
+    about = claim.final_about
+    sensitivity = claim.final_sensitivity or []
+    text = claim.final_claim
 
     chips = [f'<span class="chip status {cls}" title="{escape(label)}">'
              f'<span class="dot"></span><span aria-hidden="true">{icon}</span> {escape(label)}</span>',
@@ -269,22 +262,22 @@ def _claim_card(
         chips.append(f'<span class="chip">{escape(_SENSITIVITY_LABELS.get(s, s))}</span>')
 
     body = [f'<div class="text">{escape(text)}</div>', f'<div class="chips">{"".join(chips)}</div>',
-            f'<p class="detail">{escape(claim["detail"])}</p>']
-    if text != claim["claim"]:
-        body.append(f'<p class="meta"><b>Originally claimed</b> ({escape(claim["confidence"])} '
-                    f'confidence): {escape(claim["claim"])}</p>')
-    if claim["alternatives"]:
+            f'<p class="detail">{escape(claim.detail)}</p>']
+    if text != claim.claim:
+        body.append(f'<p class="meta"><b>Originally claimed</b> ({escape(claim.confidence)} '
+                    f'confidence): {escape(claim.claim)}</p>')
+    if claim.alternatives:
         body.append('<p class="meta"><b>Other explanations</b></p><ul>'
-                    + "".join(f"<li>{escape(a)}</li>" for a in claim["alternatives"]) + "</ul>")
+                    + "".join(f"<li>{escape(a)}</li>" for a in claim.alternatives) + "</ul>")
     if verification.get("issues"):
         body.append('<p class="meta"><b>Verifier’s concerns</b></p><ul>'
                     + "".join(f"<li>{escape(i)}</li>" for i in verification["issues"]) + "</ul>")
     when = ""
-    if claim.get("first_seen"):
-        when = claim["first_seen"]
-        if claim.get("last_seen") and claim["last_seen"] != claim["first_seen"]:
-            when += f" to {claim['last_seen']}"
-    cited = sorted((events[i] for i in claim["event_ids"] if i in events), key=lambda e: e.ts)
+    if claim.first_seen:
+        when = claim.first_seen
+        if claim.last_seen and claim.last_seen != claim.first_seen:
+            when += f" to {claim.last_seen}"
+    cited = sorted((events[i] for i in claim.event_ids if i in events), key=lambda e: e.ts)
     supporting = set(verification.get("supporting_event_ids") or [e.id for e in cited])
     lines = "\n".join(
         f'<span class="{"" if e.id in supporting else "weak"}">'
@@ -307,8 +300,8 @@ def _claim_card(
 
 def render(
     summary: str,
-    claims: list[dict],
-    trips: list[dict],
+    claims: list[Claim],
+    trips: list[Trip],
     events: list[Event],
     tz_at: Callable[[datetime], tzinfo],
     home_tz: str,
@@ -320,10 +313,10 @@ def render(
     tz = ZoneInfo(home_tz)
     by_id = {e.id: e for e in events}
     start, end = (events[0].ts, events[-1].ts) if events else (None, None)
-    live = [c for c in claims if _status(c) != "unconfirmed"]
-    statuses = Counter(_status(c) for c in claims)
-    sensitive = [c for c in live if c.get("final_sensitivity", c["sensitivity"])]
-    by_sensitivity = Counter(s for c in live for s in c.get("final_sensitivity", c["sensitivity"]))
+    live = [c for c in claims if c.status != "unconfirmed"]
+    statuses = Counter(c.status for c in claims)
+    sensitive = [c for c in live if c.final_sensitivity]
+    by_sensitivity = Counter(s for c in live for s in (c.final_sensitivity or []))
     days = len({e.ts.astimezone(tz_at(e.ts)).date() for e in events})
 
     out = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
@@ -337,8 +330,7 @@ def render(
 
     tiles = [("Events", f"{len(events):,}"), ("Trips away", str(len(trips))),
              ("Claims", str(len(live))), ("Sensitive claims", str(len(sensitive))),
-             ("High confidence", str(sum(1 for c in live if c.get("final_confidence",
-                                                                    c["confidence"]) == "high")))]
+             ("High confidence", str(sum(1 for c in live if c.final_confidence == "high")))]
     out.append('<div class="tiles">' + "".join(
         f'<div class="card tile"><div class="label">{escape(k)}</div>'
         f'<div class="value">{escape(v)}</div></div>' for k, v in tiles) + "</div>")
@@ -375,11 +367,10 @@ def render(
         out.append(f'<div class="card timeline">{_timeline_svg(trips, start, end, tz)}</div>')
         rows = []
         for t in trips:
-            s, e = datetime.fromisoformat(t["start"]), datetime.fromisoformat(t["end"])
-            zone = ZoneInfo(t["tz"])
-            rows.append(f"<tr><td>{escape(_span(s, e, zone))}</td><td>{escape(t['place'])}</td>"
-                        f"<td>{escape(_duration(s, e))}</td>"
-                        f'<td class="num">{len(t["event_ids"])}</td></tr>')
+            rows.append(f"<tr><td>{escape(_span(t.start_dt, t.end_dt, t.zone))}</td>"
+                        f"<td>{escape(t.place)}</td>"
+                        f"<td>{escape(_duration(t.start_dt, t.end_dt))}</td>"
+                        f'<td class="num">{len(t.event_ids)}</td></tr>')
         out.append('<div class="card" style="margin-top:12px"><table><thead><tr><th>Dates</th>'
                    '<th>Place</th><th>Length</th><th style="text-align:right">Evidence lines</th>'
                    "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
@@ -402,14 +393,14 @@ def render(
         "</label>"
         '<span id="f-count"></span></div>'
     )
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, list[Claim]] = {}
     for c in claims:
-        groups.setdefault(c["category"], []).append(c)
+        groups.setdefault(c.category, []).append(c)
     n = 0
     for category, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         out.append(f'<section class="group"><h3>{escape(_title(category))}</h3>')
-        items.sort(key=lambda c: (_status(c) == "unconfirmed",
-                                  _CONFIDENCE_ORDER[c.get("final_confidence", c["confidence"])]))
+        items.sort(key=lambda c: (c.status == "unconfirmed",
+                                  _CONFIDENCE_ORDER[c.final_confidence]))
         for c in items:
             out.append(_claim_card(c, by_id, tz_at, f"claim-{n}"))
             n += 1

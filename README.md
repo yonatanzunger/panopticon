@@ -3,15 +3,45 @@
 Shows people how much their Google activity history reveals about them.
 
 Input is a Google Takeout export of **My Activity** (the `Search`, `Ads`, and `AI Mode`
-folders). Stages 0–2 run entirely on your machine. Stage 3 sends the compressed transcript to
-the Claude API; use `--dry-run` to see exactly what would be sent first.
+folders). The local phases run entirely on your machine; the LLM phases send the compressed
+transcript and derived facts to the Claude API (every one has a `--dry-run` that shows exactly
+what would be sent).
 
-## Running the pipeline
+## Running it
 
-Each stage reads and writes files in one output directory (`out/` by default, which is
-gitignored). Run the stages in order.
+Everything lives in one output directory (`out/` by default, gitignored). First `prepare` it
+from a Takeout export, then let `run` do the rest:
 
-### Stages 0–2: ingest, compress, features (local)
+```bash
+uv run panopticon prepare ~/Downloads/Takeout -o out/ --days 120   # bootstrap the directory
+uv run panopticon run out/                                         # extract → … → report
+```
+
+`run` executes every phase whose code or inputs have changed since it last ran, in order, up
+to `report`, and skips the rest. So after editing a prompt or re-running `prepare`, `run` again
+redoes only what's affected (an LLM phase that re-runs costs money — `run out/ --plan` shows
+what would run without running it). It tracks this in `out/pipeline.json`.
+
+```bash
+uv run panopticon run out/ --plan     # list the phases that are stale; run nothing
+uv run panopticon run out/ --force    # re-run every phase
+uv run panopticon run out/ --adopt    # mark the current outputs as up-to-date without running
+```
+
+Use `--adopt` on a directory whose phases you ran by hand before `run` existed, so `run` won't
+redo finished work.
+
+The phases, in order: `extract` → `itinerary` → `synthesize` → `enrich` → `verify` →
+`summarize` → `report`. (`prepare` is the bootstrap and is run on its own.)
+
+## Individual phases
+
+You can also run any phase on its own — useful for iterating on one stage, passing non-default
+options (`--model`, `--effort`, `--dry-run`), or inspecting its output. **Running a phase
+directly also updates the run state**, so a later `run` won't redo it. Each phase reads the
+output directory and writes back into it.
+
+### prepare: ingest, compress, features (local)
 
 ```bash
 uv run panopticon prepare ~/Downloads/Takeout -o out/                 # all history
@@ -107,12 +137,28 @@ uv run panopticon synthesize out/ --model claude-opus-5-5 --effort xhigh
   trips it cites, and alternative explanations. Citations are checked locally: claims get
   their source event ids and the dates their evidence spans, and citations to ids that don't
   exist are moved to `unresolved_evidence`.
-- Refuses ranges whose facts won't fit in one request (see TODO).
+- **Hierarchical for long histories.** When the facts exceed one request, synthesis runs once
+  per time window and then merges the per-window claims into one profile, unioning their
+  evidence ids. Evidence ids are global, so citations survive the merge.
 
 Writes:
 
 - `profile.json`: the summary and claims
 - `profile.md`: the same, readable, grouped by category
+
+### enrich (local; noop for now)
+
+```bash
+uv run panopticon enrich out/
+```
+
+- The framework for a phase that gathers external evidence about the subject (e.g. public web
+  pages) for verification to weigh. No enrichers are implemented yet, so this writes an empty
+  `enrichment.json`. The design is in the TODO list.
+
+Writes:
+
+- `enrichment.json`: `{"enrichers": [...], "findings": [...]}` (currently empty)
 
 ### Stage 6: verification (Claude API)
 
@@ -196,19 +242,23 @@ uv run pytest
 | 2. Deterministic features: location fixes → timezone, home, daily rhythm, app usage | `features.py` | `prepare` | done |
 | 3. LLM evidence extraction: place and fact atoms | `extract.py` | `extract` | done |
 | 4. Itinerary solver and re-localization | `itinerary.py` | `itinerary` | done |
-| 5. LLM synthesis of claims, with cited evidence | `synthesize.py` | `synthesize` | done |
+| 5. LLM synthesis of claims (hierarchical when large), with cited evidence | `synthesize.py` | `synthesize` | done |
+| 5b. Enrichment framework (gather external evidence) | `enrich.py` | `enrich` | noop |
 | 6. LLM verification of each claim against its cited lines | `verify.py` | `verify` | done |
 | 7. Final summary from the verified claims | `summarize.py` | `summarize` | done |
 | 8. Report | `report.py` | `report` | done |
+
+Typed objects (`model.py`: `Claim`, `Trip`) are passed between phases in memory and serialized
+to JSON on disk. The `run` orchestrator (`pipeline.py`) tracks phase freshness in
+`out/pipeline.json`.
 
 ## TODO
 
 - **Home that changes over time.** `features.home` picks one home for the whole range, so on a
   long history every earlier residence is treated as travel (or missed). Infer home per period,
   e.g. the dominant overnight location per month, and let the itinerary solver use it.
-- **Hierarchical synthesis.** Long histories produce more facts than one synthesis request
-  holds; synthesize per period (say, per year), then synthesize the period profiles.
-- **Web research (`research`, between `synthesize` and `verify`).** Find public information
+- **Web research (the first `enrich` enricher, between `synthesize` and `verify`).** Find public
+  information
   that supports or contradicts the profile, as a human researcher would, especially to test an
   identity hypothesis. Agreed design:
   - Runs before verification, so web findings become evidence the verifier weighs. The

@@ -10,9 +10,11 @@ from zoneinfo import ZoneInfo
 import anthropic
 
 from panopticon import (
-    compress, extract, features, ingest, itinerary, report, summarize, synthesize, verify,
+    compress, enrich, extract, features, ingest, itinerary, model, pipeline, report, summarize,
+    synthesize, verify,
 )
 from panopticon.events import Event, Kind, read_events, write_events
+from panopticon.model import Trip
 
 
 def _parse_time(value: str) -> datetime:
@@ -148,6 +150,7 @@ def extract_command(args: argparse.Namespace) -> None:
     for r in results:
         if r.stop_reason != "end_turn":
             print(f"  chunk {r.chunk}: stop_reason={r.stop_reason}; no atoms from this chunk")
+    pipeline.record(args.dir, "extract")
 
 
 def itinerary_command(args: argparse.Namespace) -> None:
@@ -192,14 +195,16 @@ def itinerary_command(args: argparse.Namespace) -> None:
             f" {len(s.event_ids)} events"
         )
     print(f"wrote {args.dir / 'itinerary.json'} and {args.dir / 'transcript_local.txt'}")
+    pipeline.record(args.dir, "itinerary")
 
 
 def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf8").splitlines() if line]
 
 
-# A single synthesis request must fit in context with room to think and answer.
-_MAX_SYNTHESIS_TOKENS = 600_000
+# The most prompt (in characters) to put in one synthesis request, leaving the 1M-token
+# context room to think and answer. Above this, synthesis goes hierarchical. ~2 chars/token.
+_MAX_SYNTHESIS_CHARS = 1_000_000
 
 
 def synthesize_command(args: argparse.Namespace) -> None:
@@ -214,7 +219,7 @@ def synthesize_command(args: argparse.Namespace) -> None:
     if itinerary_path.exists():
         segments = json.loads(itinerary_path.read_text(encoding="utf8"))
         tz_at = itinerary.Localizer.from_json(segments, default=default_tz)
-        trips = [s for s in segments if not s["is_home"]]
+        trips = Trip.from_segments(segments)
     else:
         print("no itinerary.json: run `itinerary` for trips and local times", file=sys.stderr)
         tz_at = itinerary.Localizer([], default=default_tz)
@@ -222,31 +227,41 @@ def synthesize_command(args: argparse.Namespace) -> None:
 
     inputs = synthesize.build_inputs(facts, trips, events, home, tz_at)
     chars = len(inputs.text) + len(synthesize.SYSTEM_PROMPT)
-    _estimate(args.model, chars, 1, out_per_request=30_000)
-    if chars / _CHARS_PER_TOKEN > _MAX_SYNTHESIS_TOKENS:
-        sys.exit("too many facts for one synthesis request; run on a shorter range "
-                 "(hierarchical synthesis is a TODO)")
+    # Over the budget, synthesis is hierarchical: one request per time window plus a merge.
+    windows = synthesize.partition_facts(
+        facts, events, tz_at, max(_MAX_SYNTHESIS_CHARS - (chars - len(inputs.text)), 1)
+    )
+    hierarchical = chars > _MAX_SYNTHESIS_CHARS and len(windows) > 1
+    requests = len(windows) + 1 if hierarchical else 1
+    _estimate(args.model, chars, requests, out_per_request=30_000)
+    if hierarchical:
+        print(f"facts exceed one request; synthesizing in {len(windows)} periods, then merging")
 
     if args.dry_run:
         (args.dir / "synthesis_prompt.txt").write_text(inputs.text, encoding="utf8")
-        print(f"dry run: wrote the exact prompt to {args.dir / 'synthesis_prompt.txt'}; "
-              "nothing sent")
+        print(f"dry run: wrote the exact prompt (single-pass form) to "
+              f"{args.dir / 'synthesis_prompt.txt'}; nothing sent")
         return
 
-    result = _call_api(
-        lambda: synthesize.run(inputs, facts, trips, events, tz_at, args.model, args.effort)
-    )
+    if hierarchical:
+        result = _call_api(lambda: synthesize.run_hierarchical(
+            facts, trips, events, home, tz_at, _MAX_SYNTHESIS_CHARS, args.model, args.effort))
+    else:
+        result = _call_api(
+            lambda: synthesize.run(inputs, facts, trips, events, tz_at, args.model, args.effort)
+        )
     if result.stop_reason != "end_turn":
         sys.exit(f"synthesis stopped with stop_reason={result.stop_reason}; no profile written")
     synthesize.write(result, args.dir)
-    unresolved = sum(1 for c in result.claims if not c["evidence"])
+    unresolved = sum(1 for c in result.claims if not c.evidence)
     print(f"{len(result.claims)} claims written to {args.dir / 'profile.json'} and "
           f"{args.dir / 'profile.md'}")
     if unresolved:
         print(f"  {unresolved} claim(s) cite no evidence that exists", file=sys.stderr)
+    pipeline.record(args.dir, "synthesize")
 
 
-def _localizer(out: Path, home: features.Home | None) -> tuple[itinerary.Localizer, list[dict]]:
+def _localizer(out: Path, home: features.Home | None) -> tuple[itinerary.Localizer, list[Trip]]:
     """The itinerary's localizer and its trips, or home-zone times and no trips."""
     default_tz = home.tz if home else "UTC"
     segments = report.load_json(out / "itinerary.json")
@@ -254,7 +269,7 @@ def _localizer(out: Path, home: features.Home | None) -> tuple[itinerary.Localiz
         return itinerary.Localizer([], default=default_tz), []
     return (
         itinerary.Localizer.from_json(segments, default=default_tz),
-        [s for s in segments if not s["is_home"]],
+        Trip.from_segments(segments),
     )
 
 
@@ -264,7 +279,7 @@ def verify_command(args: argparse.Namespace) -> None:
     if not isinstance(profile, dict):
         sys.exit(f"no {args.dir / 'profile.json'}: run `synthesize` first")
     tz_at, _ = _localizer(args.dir, home)
-    claims = profile["claims"]
+    claims = [model.Claim.from_dict(c) for c in profile["claims"]]
     by_id = {e.id: e for e in events}
     activity = synthesize.activity_block(events, tz_at)
     prompts = [verify.claim_prompt(c, by_id, tz_at, activity) for c in claims]
@@ -284,9 +299,10 @@ def verify_command(args: argparse.Namespace) -> None:
                            activity)
     )
     verify.write(profile["summary"], verified, results, args.dir)
-    statuses = Counter(c["status"] for c in verified)
+    statuses = Counter(c.status for c in verified)
     print(f"{len(verified)} claims: " + ", ".join(f"{n} {s}" for s, n in statuses.most_common())
           + f"; written to {args.dir / 'verified.json'}")
+    pipeline.record(args.dir, "verify")
 
 
 def summarize_command(args: argparse.Namespace) -> None:
@@ -295,7 +311,8 @@ def summarize_command(args: argparse.Namespace) -> None:
         sys.exit(f"no {args.dir / 'verified.json'}: run `verify` first")
     _, home = load_prepared(args.dir)
     _, trips = _localizer(args.dir, home)
-    prompt = summarize.build_prompt(verified["claims"], trips)
+    prompt = summarize.build_prompt(
+        [model.Claim.from_dict(c) for c in verified["claims"]], trips)
     _estimate(args.model, len(prompt) + len(summarize.SYSTEM_PROMPT), 1, out_per_request=3_000)
     if args.dry_run:
         (args.dir / "summarize_prompt.txt").write_text(prompt, encoding="utf8")
@@ -307,6 +324,57 @@ def summarize_command(args: argparse.Namespace) -> None:
         sys.exit(f"summary stopped with stop_reason={result.stop_reason}; nothing written")
     summarize.write(result, args.dir)
     print(f"wrote {args.dir / 'summary.json'}")
+    pipeline.record(args.dir, "summarize")
+
+
+def enrich_command(args: argparse.Namespace) -> None:
+    profile = report.load_json(args.dir / "profile.json")
+    if not isinstance(profile, dict):
+        sys.exit(f"no {args.dir / 'profile.json'}: run `synthesize` first")
+    _, trips = _localizer(args.dir, load_prepared(args.dir)[1])
+    result = enrich.run([model.Claim.from_dict(c) for c in profile["claims"]], trips)
+    enrich.write(result, args.dir)
+    if result.enrichers:
+        print(f"{len(result.findings)} findings from {', '.join(result.enrichers)}; "
+              f"wrote {args.dir / 'enrichment.json'}")
+    else:
+        print(f"no enrichers configured; wrote an empty {args.dir / 'enrichment.json'}")
+    pipeline.record(args.dir, "enrich")
+
+
+def _phase_runners() -> dict[str, Callable[[Path], None]]:
+    """Map each pipeline phase to a callable that runs it with default options."""
+    def ns(**kw: object) -> argparse.Namespace:
+        return argparse.Namespace(**kw)
+
+    return {
+        "extract": lambda d: extract_command(ns(
+            dir=d, model=extract.DEFAULT_MODEL, effort=extract.DEFAULT_EFFORT,
+            chunk_chars=extract.DEFAULT_CHUNK_CHARS, concurrency=4, dry_run=False)),
+        "itinerary": lambda d: itinerary_command(ns(dir=d)),
+        "synthesize": lambda d: synthesize_command(ns(
+            dir=d, model=synthesize.DEFAULT_MODEL, effort=synthesize.DEFAULT_EFFORT,
+            dry_run=False)),
+        "enrich": lambda d: enrich_command(ns(dir=d)),
+        "verify": lambda d: verify_command(ns(
+            dir=d, model=verify.DEFAULT_MODEL, effort=verify.DEFAULT_EFFORT, concurrency=8,
+            dry_run=False)),
+        "summarize": lambda d: summarize_command(ns(
+            dir=d, model=summarize.DEFAULT_MODEL, effort=summarize.DEFAULT_EFFORT, dry_run=False)),
+        "report": lambda d: report_command(ns(dir=d, output=None)),
+    }
+
+
+def run_command(args: argparse.Namespace) -> None:
+    if not (args.dir / "events.jsonl").exists():
+        sys.exit(f"{args.dir} has no events.jsonl; run `prepare` first")
+    if args.adopt:
+        config = pipeline.load_config(args.dir)
+        adopted = pipeline.adopt(args.dir, config)
+        pipeline.save_config(args.dir, config)
+        print(f"adopted existing outputs as up-to-date: {', '.join(adopted) or 'none'}")
+        return
+    pipeline.run_pipeline(args.dir, _phase_runners(), force=args.force, plan_only=args.plan)
 
 
 def report_command(args: argparse.Namespace) -> None:
@@ -335,11 +403,14 @@ def report_command(args: argparse.Namespace) -> None:
     usage = report.api_usage({"extract": extract_log, "synthesize": profile, "verify": verified,
                               "summarize": final})
     html = report.render(final["summary"] if summary_is_final else source["summary"],
-                         source["claims"], trips, events, tz_at, home.tz if home else "UTC",
+                         [model.Claim.from_dict(c) for c in source["claims"]], trips, events,
+                         tz_at, home.tz if home else "UTC",
                          usage, summary_is_final)
     path = args.output or args.dir / "report.html"
     path.write_text(html, encoding="utf8")
     print(f"wrote {path} ({len(html) / 1000:,.0f} kB); it loads nothing from the network")
+    if args.output is None:  # recorded only when writing the default report.html the graph tracks
+        pipeline.record(args.dir, "report")
 
 
 def main() -> None:
@@ -423,9 +494,23 @@ def main() -> None:
         help="write the exact prompt that would be sent, and estimate cost; send nothing",
     )
 
+    p = subparsers.add_parser(
+        "enrich", help="gather external evidence about the subject (noop until enrichers exist)"
+    )
+    p.add_argument("dir", type=Path, help="an output directory with a `synthesize` profile")
+
     p = subparsers.add_parser("report", help="write a self-contained HTML report (local)")
     p.add_argument("dir", type=Path, help="an output directory with a profile")
     p.add_argument("-o", "--output", type=Path, help="where to write it (default: DIR/report.html)")
+
+    p = subparsers.add_parser(
+        "run", help="run every pipeline phase whose inputs or code changed, up to report"
+    )
+    p.add_argument("dir", type=Path, help="a prepared output directory")
+    p.add_argument("--force", action="store_true", help="re-run every phase")
+    p.add_argument("--plan", action="store_true", help="show what would run; run nothing")
+    p.add_argument("--adopt", action="store_true",
+                   help="record existing outputs as up-to-date without running anything")
 
     args = parser.parse_args()
     if args.command == "prepare":
@@ -441,5 +526,9 @@ def main() -> None:
         verify_command(args)
     elif args.command == "summarize":
         summarize_command(args)
+    elif args.command == "enrich":
+        enrich_command(args)
     elif args.command == "report":
         report_command(args)
+    elif args.command == "run":
+        run_command(args)

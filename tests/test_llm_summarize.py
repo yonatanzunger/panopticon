@@ -62,15 +62,17 @@ def test_call_discards_refused_or_truncated_output():
 
 
 def test_summary_prompt_uses_final_forms():
-    claim = {
-        "category": "health", "claim": "Takes propranolol daily.", "confidence": "high",
-        "about": "self", "sensitivity": ["health"], "status": "revised",
+    from panopticon.model import Claim, Trip
+
+    claim = Claim.from_dict({
+        "category": "health", "claim": "Takes propranolol daily.", "detail": "d",
+        "confidence": "high", "about": "self", "sensitivity": ["health"], "status": "revised",
         "final_claim": "Has looked up propranolol dosing.", "final_confidence": "low",
         "final_about": "unclear", "final_sensitivity": ["health"],
-    }
-    old = claim | {"status": "dropped"}
-    trip = {"start": "2026-08-14T07:00:00+00:00", "end": "2026-08-21T05:00:00+00:00",
-            "place": "Lima, Peru"}
+    })
+    old = Claim.from_dict(claim.to_verified_dict() | {"status": "dropped"})
+    trip = Trip(start="2026-08-14T07:00:00+00:00", end="2026-08-21T05:00:00+00:00",
+                place="Lima, Peru", tz="America/Lima")
     prompt = build_prompt([claim, old], [trip])
     assert ("C0 [revised; low confidence; about unclear; health; sensitive: health] "
             "Has looked up propranolol dosing.") in prompt

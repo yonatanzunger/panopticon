@@ -4,7 +4,8 @@ from panopticon.events import Event, Kind
 from panopticon.extract import Chunk, Extraction, validate
 from panopticon.features import Home
 from panopticon.itinerary import Localizer
-from panopticon.synthesize import Claim, Profile, build_inputs, resolve, to_markdown
+from panopticon.model import Trip
+from panopticon.synthesize import ClaimDraft, Profile, build_inputs, resolve, to_markdown
 
 T0 = datetime(2026, 8, 1, 18, tzinfo=UTC)
 HOME = Home(37.38, -122.10, "America/Los_Angeles", 30, 30)
@@ -27,8 +28,8 @@ FACT = {
     "inference": "May take propranolol.", "about": "self", "strength": "moderate",
     "sensitivity": ["health"],
 }
-TRIP = {"start": "2026-08-14T07:00:00+00:00", "end": "2026-08-21T05:00:00+00:00",
-        "place": "Lima, Peru", "event_ids": [2], "tz": "America/Lima", "is_home": False}
+TRIP = Trip(start="2026-08-14T07:00:00+00:00", end="2026-08-21T05:00:00+00:00",
+            place="Lima, Peru", event_ids=[2], tz="America/Lima", is_home=False)
 
 
 def test_validate_drops_ids_outside_the_chunk():
@@ -60,8 +61,8 @@ def test_build_inputs():
     assert "most visited sites: smbc-comics.com (1)" in inputs.text
 
 
-def claim(evidence: list[str]) -> Claim:
-    return Claim(
+def claim(evidence: list[str]) -> ClaimDraft:
+    return ClaimDraft(
         category="health", claim="Takes propranolol.", detail="Searched dosage twice.",
         confidence="medium", about="self", sensitivity=["health"], evidence=evidence,
         alternatives=["Researching it for someone else."],
@@ -72,10 +73,10 @@ def test_resolve_attaches_events_and_flags_bad_citations():
     inputs = build_inputs([FACT], [TRIP], EVENTS, HOME, LA)
     profile = Profile(summary="s", claims=[claim(["F0", "T0", "F7"])])
     (resolved,) = resolve(profile, inputs, [FACT], [TRIP], EVENTS, LA)
-    assert resolved["evidence"] == ["F0", "T0"]
-    assert resolved["unresolved_evidence"] == ["F7"]
-    assert resolved["event_ids"] == [0, 1, 2]
-    assert (resolved["first_seen"], resolved["last_seen"]) == ("2026-08-01", "2026-08-11")
+    assert resolved.evidence == ["F0", "T0"]
+    assert resolved.unresolved_evidence == ["F7"]
+    assert resolved.event_ids == [0, 1, 2]
+    assert (resolved.first_seen, resolved.last_seen) == ("2026-08-01", "2026-08-11")
 
 
 def test_markdown():
