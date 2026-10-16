@@ -1,13 +1,14 @@
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anthropic
 
-from panopticon import compress, extract, features, ingest, itinerary
+from panopticon import compress, extract, features, ingest, itinerary, synthesize
 from panopticon.events import Event, Kind, read_events, write_events
 
 
@@ -95,6 +96,28 @@ _PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00),
            "claude-haiku-5-5": (0.10, 0.50)}
 
 
+def _estimate(model: str, prompt_chars: int, requests: int, out_per_request: int) -> None:
+    in_tokens = prompt_chars / _CHARS_PER_TOKEN
+    price_in, price_out = _PRICES.get(model, (0, 0))
+    print(f"{requests} request(s), ~{in_tokens:,.0f} input tokens to {model}")
+    if price_in:
+        cost = (in_tokens * price_in + requests * out_per_request * price_out) / 1e6
+        print(f"estimated cost: ~${cost:.2f} (output estimated at "
+              f"{out_per_request // 1000}k tokens/request)")
+
+
+def _call_api[T](fn: Callable[[], T]) -> T:
+    """Run a stage's API calls, turning API failures into a clear message and exit code."""
+    try:
+        return fn()
+    except anthropic.AuthenticationError:
+        sys.exit("Claude API authentication failed: run `ant auth login` or set ANTHROPIC_API_KEY.")
+    except anthropic.APIStatusError as e:
+        sys.exit(f"Claude API error {e.status_code}: {e.message} (request {e.request_id})")
+    except anthropic.APIConnectionError as e:
+        sys.exit(f"Could not reach the Claude API: {e}")
+
+
 def extract_command(args: argparse.Namespace) -> None:
     events, home = load_prepared(args.dir)
     tz = ZoneInfo(home.tz if home else "UTC")
@@ -102,15 +125,8 @@ def extract_command(args: argparse.Namespace) -> None:
         compress.sessionize(events), args.chunk_chars, tz_at=lambda _: tz
     )
     chunks = extract.make_chunks(groups, tz_at=lambda _: tz)
-
     chars = sum(len(c.text) for c in chunks) + len(chunks) * len(extract.SYSTEM_PROMPT)
-    in_tokens = chars / _CHARS_PER_TOKEN
-    out_tokens = len(chunks) * 8_000
-    price_in, price_out = _PRICES.get(args.model, (0, 0))
-    cost = (in_tokens * price_in + out_tokens * price_out) / 1e6
-    print(f"{len(chunks)} chunks, ~{in_tokens:,.0f} input tokens to {args.model}")
-    if price_in:
-        print(f"estimated cost: ~${cost:.2f} (output estimated at 8k tokens/chunk)")
+    _estimate(args.model, chars, len(chunks), out_per_request=20_000)
 
     if args.dry_run:
         for chunk in chunks:
@@ -119,19 +135,16 @@ def extract_command(args: argparse.Namespace) -> None:
         print(f"dry run: wrote the exact user prompts to {args.dir}/chunk_*.txt; nothing sent")
         return
 
-    try:
-        results = extract.run(chunks, home, args.dir, args.model, args.effort, args.concurrency)
-    except anthropic.AuthenticationError:
-        sys.exit("Claude API authentication failed: run `ant auth login` or set ANTHROPIC_API_KEY.")
-    except anthropic.APIStatusError as e:
-        sys.exit(f"Claude API error {e.status_code}: {e.message} (request {e.request_id})")
-    except anthropic.APIConnectionError as e:
-        sys.exit(f"Could not reach the Claude API: {e}")
-    atoms = sum(len(r.evidence) for r in results)
-    problems = [r for r in results if r.stop_reason != "end_turn"]
-    print(f"{atoms} place atoms written to {args.dir / 'places.jsonl'}")
-    for r in problems:
-        print(f"  chunk {r.chunk}: stop_reason={r.stop_reason}; no atoms from this chunk")
+    results = _call_api(
+        lambda: extract.run(chunks, home, args.dir, args.model, args.effort, args.concurrency)
+    )
+    places = sum(len(r.places) for r in results)
+    facts = sum(len(r.facts) for r in results)
+    print(f"{places} place atoms and {facts} fact atoms written to "
+          f"{args.dir / 'places.jsonl'} and {args.dir / 'facts.jsonl'}")
+    for r in results:
+        if r.stop_reason != "end_turn":
+            print(f"  chunk {r.chunk}: stop_reason={r.stop_reason}; no atoms from this chunk")
 
 
 def itinerary_command(args: argparse.Namespace) -> None:
@@ -146,7 +159,7 @@ def itinerary_command(args: argparse.Namespace) -> None:
         print("no places.jsonl from `extract`; using location fixes only", file=sys.stderr)
 
     segments, places = itinerary.build(atoms, events, home)
-    localizer = itinerary.Localizer(segments, default=home.tz if home else "UTC")
+    localizer = itinerary.Localizer.from_segments(segments, default=home.tz if home else "UTC")
 
     out = [
         {
@@ -178,6 +191,58 @@ def itinerary_command(args: argparse.Namespace) -> None:
     print(f"wrote {args.dir / 'itinerary.json'} and {args.dir / 'transcript_local.txt'}")
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf8").splitlines() if line]
+
+
+# A single synthesis request must fit in context with room to think and answer.
+_MAX_SYNTHESIS_TOKENS = 600_000
+
+
+def synthesize_command(args: argparse.Namespace) -> None:
+    events, home = load_prepared(args.dir)
+    facts_path = args.dir / "facts.jsonl"
+    if not facts_path.exists():
+        sys.exit(f"no {facts_path}: run `extract` first")
+    facts = _read_jsonl(facts_path)
+    default_tz = home.tz if home else "UTC"
+
+    itinerary_path = args.dir / "itinerary.json"
+    if itinerary_path.exists():
+        segments = json.loads(itinerary_path.read_text(encoding="utf8"))
+        tz_at = itinerary.Localizer.from_json(segments, default=default_tz)
+        trips = [s for s in segments if not s["is_home"]]
+    else:
+        print("no itinerary.json: run `itinerary` for trips and local times", file=sys.stderr)
+        tz_at = itinerary.Localizer([], default=default_tz)
+        trips = []
+
+    inputs = synthesize.build_inputs(facts, trips, events, home, tz_at)
+    chars = len(inputs.text) + len(synthesize.SYSTEM_PROMPT)
+    _estimate(args.model, chars, 1, out_per_request=30_000)
+    if chars / _CHARS_PER_TOKEN > _MAX_SYNTHESIS_TOKENS:
+        sys.exit("too many facts for one synthesis request; run on a shorter range "
+                 "(hierarchical synthesis is a TODO)")
+
+    if args.dry_run:
+        (args.dir / "synthesis_prompt.txt").write_text(inputs.text, encoding="utf8")
+        print(f"dry run: wrote the exact prompt to {args.dir / 'synthesis_prompt.txt'}; "
+              "nothing sent")
+        return
+
+    result = _call_api(
+        lambda: synthesize.run(inputs, facts, trips, events, tz_at, args.model, args.effort)
+    )
+    if result.stop_reason != "end_turn":
+        sys.exit(f"synthesis stopped with stop_reason={result.stop_reason}; no profile written")
+    synthesize.write(result, args.dir)
+    unresolved = sum(1 for c in result.claims if not c["evidence"])
+    print(f"{len(result.claims)} claims written to {args.dir / 'profile.json'} and "
+          f"{args.dir / 'profile.md'}")
+    if unresolved:
+        print(f"  {unresolved} claim(s) cite no evidence that exists", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("panopticon")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -194,7 +259,8 @@ def main() -> None:
     )
 
     p = subparsers.add_parser(
-        "extract", help="stage 3: extract place evidence with Claude (sends the transcript)"
+        "extract",
+        help="stage 3: extract place and fact evidence with Claude (sends the transcript)",
     )
     p.add_argument("dir", type=Path, help="an output directory written by `prepare`")
     p.add_argument("--model", default=extract.DEFAULT_MODEL)
@@ -214,6 +280,21 @@ def main() -> None:
     )
     p.add_argument("dir", type=Path, help="an output directory written by `prepare`")
 
+    p = subparsers.add_parser(
+        "synthesize",
+        help="stage 5: join facts, itinerary, and activity into a profile with Claude",
+    )
+    p.add_argument("dir", type=Path, help="an output directory with `extract` facts")
+    p.add_argument("--model", default=synthesize.DEFAULT_MODEL)
+    p.add_argument(
+        "--effort", default=synthesize.DEFAULT_EFFORT,
+        choices=["low", "medium", "high", "xhigh", "max"],
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="write the exact prompt that would be sent, and estimate cost; send nothing",
+    )
+
     args = parser.parse_args()
     if args.command == "prepare":
         events = ingest.load(args.inputs, since=args.since, until=args.until)
@@ -222,3 +303,5 @@ def main() -> None:
         extract_command(args)
     elif args.command == "itinerary":
         itinerary_command(args)
+    elif args.command == "synthesize":
+        synthesize_command(args)

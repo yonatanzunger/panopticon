@@ -119,7 +119,7 @@ def test_localizer():
     events = background()
     lima = [e.id for e in events if 5 * 24 <= (e.ts - T0).total_seconds() / 3600 < 8 * 24]
     segments, _ = build([atom([i]) for i in lima[::4]], events, HOME)
-    at = Localizer(segments, default="America/Los_Angeles")
+    at = Localizer.from_segments(segments, default="America/Los_Angeles")
     assert str(at(T0 + timedelta(days=6))) == "America/Lima"
     assert str(at(T0 + timedelta(days=2))) == "America/Los_Angeles"
     assert str(at(T0 - timedelta(days=30))) == "America/Los_Angeles"

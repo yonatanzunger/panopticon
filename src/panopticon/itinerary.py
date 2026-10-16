@@ -8,6 +8,7 @@ itinerary drifts back home; and changing places costs SWITCH_COST, so it takes r
 to start a trip, and a lone weak signal can't.
 """
 
+import bisect
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -281,15 +282,28 @@ def build(
 class Localizer:
     """Maps a UTC timestamp to the zone the itinerary places the user in at that moment."""
 
-    def __init__(self, segments: list[Segment], default: str = "UTC") -> None:
-        self._segments = segments
-        self._starts = [s.start for s in segments]
+    def __init__(self, spans: list[tuple[datetime, datetime, str]], default: str = "UTC") -> None:
+        self._spans = sorted(spans)
+        self._starts = [start for start, _, _ in self._spans]
         self._default = ZoneInfo(default)
 
-    def __call__(self, ts: datetime) -> ZoneInfo:
-        import bisect
+    @classmethod
+    def from_segments(cls, segments: list[Segment], default: str = "UTC") -> "Localizer":
+        return cls([(s.start, s.end, s.place.tz) for s in segments], default)
 
+    @classmethod
+    def from_json(cls, records: list[dict], default: str = "UTC") -> "Localizer":
+        """From the segments in an itinerary.json."""
+        return cls(
+            [
+                (datetime.fromisoformat(r["start"]), datetime.fromisoformat(r["end"]), r["tz"])
+                for r in records
+            ],
+            default,
+        )
+
+    def __call__(self, ts: datetime) -> ZoneInfo:
         i = bisect.bisect_right(self._starts, ts) - 1
-        if 0 <= i < len(self._segments) and ts < self._segments[i].end:
-            return ZoneInfo(self._segments[i].place.tz)
+        if 0 <= i < len(self._spans) and ts < self._spans[i][1]:
+            return ZoneInfo(self._spans[i][2])
         return self._default

@@ -35,7 +35,7 @@ Writes:
 - `features.json`: location fixes with zones, home, hour histogram, daily quiet periods, app
   usage (stage 2)
 
-### Stage 3: place evidence extraction (Claude API)
+### Stage 3: evidence extraction (Claude API)
 
 Needs Claude API credentials: `ant auth login`, or `ANTHROPIC_API_KEY` in the environment.
 
@@ -47,17 +47,21 @@ uv run panopticon extract out/ --model claude-opus-5-5 --effort high --chunk-cha
 
 - The transcript is split into chunks of about 60k tokens (`--chunk-chars`), breaking only
   between days.
+- Each chunk yields two kinds of evidence atom in one request: **places** (for the itinerary)
+  and **facts** (observations and the inferences they suggest, by category, with whom they're
+  about and which kinds of sensitive information they touch).
 - Defaults are `claude-opus-5-5` at `medium` effort. Server-side refusal fallback is enabled,
   so a chunk declined by a safety classifier is retried on another model rather than lost.
 - Progress goes to stderr: a line as each chunk starts and finishes, and every 15 seconds a
   heartbeat listing in-flight chunks with elapsed time and output received so far.
-- For scale: the last 120 days of one export was 2 chunks, ~208k input tokens, ~$1.10 on
-  Opus 5.5, and a few minutes of wall time.
+- For scale: the last 120 days of one export is 2 chunks and ~210k input tokens; places-only
+  extraction cost ~$1.10 on Opus 5.5 and took a few minutes. Facts add output, so expect more.
 
 Writes:
 
 - `places.jsonl`: one place-evidence atom per line, citing event ids, with the place's
   coordinates and IANA zone
+- `facts.jsonl`: one fact atom per line, with a stable id (`F<n>`), citing event ids
 - `extract_log.jsonl`: per-chunk stop reason, serving model, token usage, and dropped atoms
 
 ### Stage 4: itinerary (local)
@@ -84,6 +88,32 @@ Writes:
 - `transcript_local.txt`: the transcript re-rendered with each session in the zone where the
   itinerary places the user
 
+### Stage 5: synthesis (Claude API)
+
+Run after `extract` and `itinerary` (without an itinerary it still works, but with no trips
+and with home-zone times).
+
+```bash
+uv run panopticon synthesize out/ --dry-run   # write the exact prompt to out/synthesis_prompt.txt, estimate cost, send nothing
+uv run panopticon synthesize out/             # run it
+uv run panopticon synthesize out/ --model claude-opus-5-5 --effort xhigh
+```
+
+- One request that joins all fact atoms, the trips, and activity statistics (event counts,
+  hour-of-day histogram, top apps, top sites) into claims. This is where evidence from months
+  apart gets combined.
+- Defaults to `claude-opus-5-5` at `high` effort, with refusal fallback.
+- Each claim has a category, confidence, whom it's about, sensitivity kinds, the facts and
+  trips it cites, and alternative explanations. Citations are checked locally: claims get
+  their source event ids and the dates their evidence spans, and citations to ids that don't
+  exist are moved to `unresolved_evidence`.
+- Refuses ranges whose facts won't fit in one request (see TODO).
+
+Writes:
+
+- `profile.json`: the summary and claims
+- `profile.md`: the same, readable, grouped by category
+
 ### Tests
 
 ```bash
@@ -97,11 +127,24 @@ uv run pytest
 | 0. Ingest: Takeout JSON → `Event`s with stable ids | `ingest.py` | `prepare` | done |
 | 1. Compress: noise removal, sessions, compact transcript | `compress.py` | `prepare` | done |
 | 2. Deterministic features: location fixes → timezone, home, daily rhythm, app usage | `features.py` | `prepare` | done |
-| 3. LLM evidence extraction (place atoms so far) | `extract.py` | `extract` | done |
+| 3. LLM evidence extraction: place and fact atoms | `extract.py` | `extract` | done |
 | 4. Itinerary solver and re-localization | `itinerary.py` | `itinerary` | done |
-| 5. LLM synthesis of claims, with cited event ids | | | |
+| 5. LLM synthesis of claims, with cited evidence | `synthesize.py` | `synthesize` | done |
 | 6. LLM verification of each claim against its evidence | | | |
 | 7. Report | | | |
+
+## TODO
+
+- **Home that changes over time.** `features.home` picks one home for the whole range, so on a
+  long history every earlier residence is treated as travel (or missed). Infer home per period,
+  e.g. the dominant overnight location per month, and let the itinerary solver use it.
+- **Hierarchical synthesis.** Long histories produce more facts than one synthesis request
+  holds; synthesize per period (say, per year), then synthesize the period profiles.
+- **Stage 6, verification.** Check each claim against only its cited source lines, and
+  downgrade or drop the ones they don't support.
+- **Stage 7, report.** The itinerary timeline and map, claims with click-through to source rows,
+  and a sensitivity summary.
+- **Inferability scoring.** For each claim, how much history it takes to infer it.
 
 ## Notes on the data
 
