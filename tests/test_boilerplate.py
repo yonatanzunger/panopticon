@@ -69,9 +69,9 @@ def flags(directory, **kw) -> argparse.Namespace:
 def test_flag_groups_replace_only_their_own_settings(tmp_path):
     cli._update_settings(flags(tmp_path, input=[tmp_path], days=120))
     s = cli._update_settings(flags(tmp_path, skip_sources=["chrome"]))
-    assert (s.days, s.sources) == (120, ["my_activity"])
+    assert (s.days, s.sources) == (120, ["my_activity", "youtube"])
     s = cli._update_settings(flags(tmp_path, days=30))
-    assert (s.days, s.sources, s.inputs) == (30, ["my_activity"], [tmp_path.resolve()])
+    assert (s.days, s.sources, s.inputs) == (30, ["my_activity", "youtube"], [tmp_path.resolve()])
     s = cli._update_settings(flags(tmp_path, all_sources=True, all_history=True))
     assert (s.days, s.sources) == (None, None)
     assert prepare.load_settings(tmp_path) == s

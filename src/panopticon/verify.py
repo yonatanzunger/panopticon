@@ -69,10 +69,11 @@ cited the history lines it rests on. You see only that claim and those lines. Ju
 skeptically, what the lines alone support.
 
 Line format: "#<id> <local date and time> [zone] <kind> <text>", optionally followed by \
-"@site" (the site of a visit), "×N" (repeated N times in a session), and "[loc LAT,LON \
+"@site" (the site of a visit, or the channel of a video), "×N" (repeated N times in a session), and "[loc LAT,LON \
 SOURCE]" (where Google recorded the user as being). Kinds: S search, S* AI Mode prompt, \
 I image search, V page visit, $ ad click, A app use, P place or business card viewed, \
-N notifications.
+N notifications, W YouTube video watched, W* YouTube Music track played, C comment or live \
+chat message the user posted on YouTube.
 
 Check:
 - Do the lines say what the claim needs, read literally? One search is curiosity more often \

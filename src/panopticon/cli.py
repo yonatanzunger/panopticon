@@ -24,6 +24,7 @@ from panopticon import (
     synthesize,
     verify,
 )
+from panopticon.events import read_events
 from panopticon.model import Trip
 
 
@@ -554,6 +555,36 @@ def run_command(args: argparse.Namespace) -> None:
     )
 
 
+def events_command(args: argparse.Namespace) -> None:
+    """Print events.jsonl as a readable log, one event per line with every field, for looking
+    at what the sources produced. Times are local to home; "~" marks events dropped as noise."""
+    events = read_events(args.dir / "events.jsonl")
+    home = json.loads((args.dir / "features.json").read_text(encoding="utf8"))["home"]
+    tz = ZoneInfo(home["tz"] if home else "UTC")
+    day = None
+    for e in events:
+        if (args.since and e.ts < args.since) or (args.until and e.ts >= args.until):
+            continue
+        if args.product and e.product not in args.product:
+            continue
+        local = e.ts.astimezone(tz)
+        if local.date() != day:
+            day = local.date()
+            print(f"\n## {local:%Y-%m-%d %a} [{tz}]")
+        fields = [e.text]
+        if e.url:
+            fields.append(e.url)
+        if e.source:
+            fields.append(f"source={e.source}")
+        if e.device:
+            fields.append(f"device={e.device}")
+        if e.lat is not None:
+            fields.append(f"loc={e.lat:.3f},{e.lon:.3f} {e.loc_source or ''}".rstrip())
+        noise = "~" if compress.is_noise(e) else " "
+        print(f"{local:%H:%M:%S}{noise}#{e.id:<7} {e.product[:18]:18} {e.kind.value:13} "
+              + " | ".join(fields))
+
+
 def report_command(args: argparse.Namespace) -> None:
     events, home = prepare.load_prepared(args.dir)
     tz_at, trips = _localizer(args.dir, home)
@@ -719,6 +750,16 @@ def main() -> None:
     )
 
     p = subparsers.add_parser(
+        "events", help="print the prepared events as a readable log, to inspect the sources"
+    )
+    p.add_argument("dir", type=Path, help="an output directory written by `prepare`")
+    p.add_argument("--since", type=_parse_time, help="show events at or after this date/time")
+    p.add_argument("--until", type=_parse_time, help="show events before this date/time")
+    p.add_argument(
+        "--product", action="append", help="show only this product; repeatable"
+    )
+
+    p = subparsers.add_parser(
         "run",
         help="run every pipeline phase whose inputs or code changed, up to report",
     )
@@ -751,5 +792,7 @@ def main() -> None:
         enrich_command(args)
     elif args.command == "report":
         report_command(args)
+    elif args.command == "events":
+        events_command(args)
     elif args.command == "run":
         run_command(args)

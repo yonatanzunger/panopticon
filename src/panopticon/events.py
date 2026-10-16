@@ -18,6 +18,10 @@ class Kind(StrEnum):
     PLACE_VIEW = "place_view"
     # A digest of notifications; the text is the list of topics and how each was handled.
     NOTIFICATIONS = "notifications"
+    # A video watched (or a track played, in YouTube Music); the source is the channel.
+    WATCH = "watch"
+    # Something the user wrote and posted: a YouTube comment or live chat message.
+    COMMENT = "comment"
     OTHER = "other"
 
 
@@ -34,7 +38,8 @@ class Event(NamedTuple):
     text: str
     # The destination URL, unwrapped from Google's redirector, when there is one.
     url: str | None
-    # The site domain or app name, when Takeout reports one (from the "header" field).
+    # The site domain or app name, when Takeout reports one (from the "header" field); for
+    # a watched video, its channel.
     source: str | None
     lat: float | None
     lon: float | None

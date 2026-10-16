@@ -105,7 +105,7 @@ def _local_day(ts: datetime, tz_at: Callable[[datetime], tzinfo]) -> str:
 def activity_block(events: list[Event], tz_at: Callable[[datetime], tzinfo]) -> str:
     """Statistics computed over every event in the range, not a sample: kinds, hours, top apps
     (with monthly counts for the top ten, so claims about when habits happened can be checked),
-    and top sites."""
+    top sites, and top channels watched."""
     lines = ["<activity>"]
     if events:
         lines.append(f"range: {_local_day(events[0].ts, tz_at)} to "
@@ -133,6 +133,11 @@ def activity_block(events: list[Event], tz_at: Callable[[datetime], tzinfo]) -> 
         lines.append("most visited sites: " + "; ".join(
             f"{s} ({n})" for s, n in sites.most_common(40) if s
         ))
+        channels = Counter(e.source for e in events if e.kind == Kind.WATCH and e.source)
+        if channels:
+            lines.append("most watched channels: " + "; ".join(
+                f"{c} ({n})" for c, n in channels.most_common(40)
+            ))
     lines.append("</activity>")
     return "\n".join(lines)
 

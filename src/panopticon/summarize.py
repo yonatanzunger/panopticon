@@ -1,4 +1,4 @@
-e""Final summary: a portrait of the user written from the verified claims.
+"""Final summary: a portrait of the user written from the verified claims.
 
 Synthesis drafts a summary too, but before verification, so it can repeat claims that were
 later narrowed or left unconfirmed. This stage writes the summary the report shows, from the

@@ -1,5 +1,5 @@
 """Google Takeout "My Activity" JSON: Search, Ads, AI Mode, and the other products' MyActivity.json
-files."""
+files. YouTube's watch and search history (``sources.youtube``) are in this format too."""
 
 import html
 import re
@@ -9,12 +9,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from panopticon.events import Kind
-from panopticon.sources import Item, Source, read_json
+from panopticon.sources import Item, Source, chrome, read_json, youtube_video_url
 
 # Order matters: longer prefixes that share a verb must come first.
 _PREFIXES: list[tuple[str, Kind]] = [
     ("Searched with an image", Kind.IMAGE_SEARCH),
     ("Searched for ", Kind.SEARCH),
+    ("Watched ", Kind.WATCH),
     ("Visited ", Kind.VISIT),
     ("Opened ", Kind.VISIT),
     ("Used ", Kind.APP_USE),
@@ -109,6 +110,22 @@ def parse_row(row: dict) -> Iterator[Item]:
     source = row.get("header") if row.get("header") not in (None, product) else None
     if source:
         source = source.removesuffix(_PLAY_STORE_SUFFIX)
+    if product == "YouTube":
+        # The header says which app: "YouTube" or "YouTube Music". The subtitle is the channel.
+        product, source = row.get("header") or product, None
+        if subtitles := row.get("subtitles"):
+            source = subtitles[0].get("name")
+        if kind == Kind.PLACE_VIEW:  # "Viewed <post text>": a community post, not a place
+            kind = Kind.VISIT
+        if kind == Kind.WATCH:
+            url = youtube_video_url(url) or url
+
+    if product == "Chrome" and kind == Kind.VISIT and url:
+        # The same page loads as Chrome's own history, so the same rules: a results page is
+        # a search, a YouTube page a watch, the redirector hop nothing.
+        if (page := chrome.classify_page(url, text)) is None:
+            return
+        kind, text, url = page
 
     item = Item(
         datetime.fromisoformat(row["time"]), product, kind, text, url, source, *_location(row)

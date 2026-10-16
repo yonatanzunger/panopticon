@@ -130,7 +130,7 @@ def _prefix_length(segments: list[str], prefix: list[str]) -> int:
 
 
 def _titled(item: Item) -> bool:
-    return item.kind in (Kind.VISIT, Kind.AD_CLICK) and bool(item.url) and not (
+    return item.kind in (Kind.VISIT, Kind.AD_CLICK, Kind.WATCH) and bool(item.url) and not (
         item.text.startswith(("http://", "https://"))
     )
 

@@ -41,6 +41,8 @@ _KIND_CODES = {
     Kind.APP_USE: "A",
     Kind.PLACE_VIEW: "P",
     Kind.NOTIFICATIONS: "N",
+    Kind.WATCH: "W",
+    Kind.COMMENT: "C",
     Kind.OTHER: "?",
 }
 
@@ -129,7 +131,9 @@ def _display(event: Event) -> str:
 
 
 def _site(event: Event) -> str:
-    """The site a visit was on, unless the title already is the URL."""
+    """The site a visit was on, unless the title already is the URL; or a video's channel."""
+    if event.kind == Kind.WATCH:
+        return f" @{event.source}" if event.source else ""
     if event.kind not in (Kind.VISIT, Kind.AD_CLICK) or not event.url:
         return ""
     if event.text.startswith(("http://", "https://")):
@@ -177,7 +181,7 @@ def _loc(event: Event) -> str:
 
 def _code(event: Event) -> str:
     code = _KIND_CODES[event.kind]
-    return code + "*" if event.product == "AI Mode" else code
+    return code + "*" if event.product in ("AI Mode", "YouTube Music") else code
 
 
 def render(
@@ -188,7 +192,8 @@ def render(
     Format: a header line per local day (and whenever the zone changes), then one line per item:
         #<event id> HH:MM <kind code> <text> [@site] [×count] [[loc lat,lon source]]
     Kind codes: S search (S* = AI Mode), I image search, V visit, $ ad click, A app use,
-    P place card, N notifications. Visits show their site after the title, as "<title> @site".
+    P place card, N notifications, W video watched (W* = YouTube Music), C comment posted.
+    Visits show their site after the title, as "<title> @site"; videos their channel.
     """
     out: list[str] = []
     header: tuple[str, str] | None = None

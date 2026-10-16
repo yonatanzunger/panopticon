@@ -164,3 +164,41 @@ def test_discover_rejects_unreadable_or_missing_inputs(tmp_path):
 def test_read_csv_strips_byte_order_mark(tmp_path):
     (tmp_path / "a.csv").write_bytes("\ufeffChannel Id,Title\nUC1,\"Hello, world\"\n".encode())
     assert list(read_csv(tmp_path / "a.csv")) == [{"Channel Id": "UC1", "Title": "Hello, world"}]
+
+
+def _activity(tmp_path, product: str, rows: list[dict]) -> None:
+    (tmp_path / "My Activity" / product).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "My Activity" / product / "MyActivity.json").write_text(json.dumps(rows))
+
+
+def test_my_activity_products_merge_and_chrome_rows_follow_chrome_rules(tmp_path):
+    t = "2026-10-10T17:52:29Z"
+    _activity(tmp_path, "Search", [
+        _row("Searched for california dmv", t) | {"locationInfos": [
+            {"name": "At this general area", "url": MAP, "source": "From your places (Home)"}]},
+        {"header": "Search", "title": "Visited Renew - California DMV", "time": t,
+         "titleUrl": "https://www.google.com/url?q=https://www.dmv.ca.gov/portal/renew/",
+         "products": ["Search"]},
+    ])
+    _activity(tmp_path, "Chrome", [
+        {"header": "Chrome", "title": "Visited california dmv - Google Search", "time": t,
+         "titleUrl": "https://www.google.com/search?q=california+dmv&oq=califo",
+         "products": ["Chrome"]},
+        {"header": "Chrome", "title": "Visited Renew - California DMV", "time": t,
+         "titleUrl": "https://www.dmv.ca.gov/portal/renew/?utm_source=x", "products": ["Chrome"]},
+        {"header": "Chrome", "title": "Visited Another page", "time": t,
+         "titleUrl": "https://www.dmv.ca.gov/other", "products": ["Chrome"]},
+    ])
+    _activity(tmp_path, "Google Analytics", [
+        {"header": "www.dmv.ca.gov/other", "title": "Visited www.dmv.ca.gov/other",
+         "titleUrl": "http://www.dmv.ca.gov/other", "time": t, "products": ["Google Analytics"]},
+    ])
+    loaded = load(discover([tmp_path]))
+    # Chrome's search page merges into the Search search; Chrome's DMV page (with tracking
+    # query) into Search's result click; Analytics's bare URL into Chrome's titled page.
+    assert loaded.duplicates == 3
+    assert sorted((e.product, e.kind.value, e.text) for e in loaded.events) == [
+        ("Chrome", "visit", "Another page"),
+        ("Search", "search", "california dmv"),
+        ("Search", "visit", "Renew - California DMV"),
+    ]

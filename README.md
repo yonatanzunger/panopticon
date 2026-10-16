@@ -136,8 +136,8 @@ uv run panopticon prepare out/                                        # re-run w
 
 - `-i` / `--input` can be a Takeout root, any folder inside one, or a single file, and can be
   repeated. Every file under it that a reader in `sources/` recognizes is read; the rest are
-  ignored. Today that's `MyActivity.json` (from any product's `My Activity` folder) and
-  `Chrome/History.json`.
+  ignored. Today that's `MyActivity.json` (from any product's `My Activity` folder),
+  `Chrome/History.json`, and YouTube's watch and search history, comments, and live chats.
 - `--sources chrome,my_activity` reads only the named sources; `--skip-sources chrome` reads
   all but those; `--all-sources` goes back to reading everything (the default). Use two output
   directories to compare a run with and without a source.
@@ -172,6 +172,18 @@ Writes:
   with a Google location carry a `[loc lat,lon source]` tag (stage 1)
 - `features.json`: location fixes with zones, home, hour histogram, daily quiet periods, app
   usage (stage 2)
+
+#### events: inspect what the sources produced (local)
+
+```bash
+uv run panopticon prepare out/sample -i ~/Downloads/Takeout --since 2026-10-10 --until 2026-10-13
+uv run panopticon events out/sample > out/sample/events.txt          # every event, every field
+uv run panopticon events out/sample --product "Google Play Store"     # one product
+```
+
+Prints `events.jsonl` one event per line, in home-zone local time, with product, kind, text,
+URL, source, device, and location; `~` after the time marks events dropped as noise. Not a
+pipeline phase, and it writes nothing. Its output is as private as the export.
 
 #### extract: evidence extraction (Claude API)
 
@@ -351,12 +363,18 @@ uv run panopticon report out/ -o ~/Desktop/my-report.html
   searches, and ~95% of them are also in My Activity, usually within a second; Google's
   `/url` redirector hops are dropped. The other Chrome files (bookmarks, reading list,
   extensions, settings, autofill addresses) aren't read.
+- **YouTube** watch and search history (`YouTube and YouTube Music/history/`) are My
+  Activity rows, the same as `My Activity/YouTube`; if both are exported they merge almost
+  entirely. Watches are `W` lines (`W*` for YouTube Music) with the channel as `@channel`;
+  "Viewed" in YouTube is a community post, not a place card. Comments and live chats are `C`
+  lines: the user's own words, with the video's title when the watch history has it.
+  Subscriptions, playlists, and the user's uploads aren't read.
 - Timestamps are UTC throughout; localization happens at render time.
 
 ### TODO
 
-- **More Takeout sources.** Timeline and YouTube, as modules in `sources/`. Timeline's visits
-  span time rather than being instants.
+- **More Takeout sources.** Timeline, as a module in `sources/`. Its visits span time rather
+  than being instants.
 - **Use Chrome's device in the transcript.** `Event.device` is recorded but not yet rendered,
   so the LLM can't tell phone browsing from desktop.
 - **Home that changes over time.** `features.home` picks one home for the whole range, so on a

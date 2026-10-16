@@ -6,6 +6,7 @@ from collections.abc import Collection
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 from panopticon import boilerplate, sources
 from panopticon.events import Event, Kind
@@ -39,21 +40,65 @@ def discover(
     ]
 
 
-def _identity(item: Item) -> tuple[Kind, str]:
-    """What makes two sources' items the same activity: a search's query, else the URL."""
+# Which product's record of an activity to keep, whichever source it came from (then by
+# source order): those with the most context first. Search has locations; Chrome has page titles; Ads and Google Analytics, which saw the
+# page from a tracker, have little more than the URL. Unlisted products go in between.
+_PRODUCT_PRIORITY = ("Search", "AI Mode", "Image Search", "Maps", "YouTube", "YouTube Music")
+_PRODUCT_LAST = ("Chrome", "Ads", "Google Analytics")
+
+
+def _product_rank(product: str) -> tuple[int, int]:
+    if product in _PRODUCT_PRIORITY:
+        return 0, _PRODUCT_PRIORITY.index(product)
+    if product in _PRODUCT_LAST:
+        return 2, _PRODUCT_LAST.index(product)
+    return 1, 0
+
+
+# Where a search with no URL was made, by product. Anything else is a Google search.
+_SEARCH_ENGINES = {"YouTube": "youtube.com", "YouTube Music": "youtube.com"}
+
+
+def _engine(item: Item) -> str:
+    if item.url and (host := urlparse(item.url).hostname):
+        return "youtube.com" if host.endswith("youtube.com") else host.removeprefix("www.")
+    return _SEARCH_ENGINES.get(item.product, "google.com")
+
+
+def _page(url: str) -> str:
+    """A page, ignoring scheme, "www.", query, and fragment: Google Analytics records
+    "http://site/path" for what Chrome recorded as "https://www.site/path?q=...", and Docs
+    pages pick up "?tab=..." as they're used."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").removeprefix("www.")
+    return host + (parsed.path.rstrip("/") or "")
+
+
+def _identity(item: Item) -> tuple[Kind, str, str]:
+    """What makes two records the same activity: a search's query on the same search engine;
+    a page visit's page (an ad click is a visit to its landing page); else the URL (for a
+    video, its canonical URL)."""
     if item.kind in (Kind.SEARCH, Kind.IMAGE_SEARCH) or not item.url:
-        return item.kind, " ".join(item.text.lower().split())
-    return item.kind, item.url
+        return item.kind, _engine(item), " ".join(item.text.lower().split())
+    if item.kind in (Kind.VISIT, Kind.AD_CLICK):
+        return Kind.VISIT, "", _page(item.url)
+    return item.kind, "", item.url
+
+
+# What a dropped copy can fill in on the record kept: facts about the same event. Not the
+# source, which means something different in each product.
+_FILLABLE = ("url", "device", "lat", "lon", "loc_source", "loc_precise")
 
 
 def merge_duplicates(by_source: list[list[Item]]) -> tuple[list[Item], int]:
-    """Merge per-source item lists, given in priority order. An item that matches one from a
-    higher-priority source within DUPLICATE_WINDOW is a second record of the same activity: it
-    is dropped, and fills in any fields the kept item lacks (a Chrome visit's device, say).
-    Matching is one-to-one, so reloading a page five times in Chrome while My Activity recorded
-    one visit keeps four. Items within one source are never merged: repeats there are real, and
-    compress counts them. Returns the kept items and the number merged away."""
-    seen: dict[tuple[Kind, str], list[tuple[float, int]]] = defaultdict(list)  # (ts, kept index)
+    """Merge item lists, one per record stream (a source's product), given in priority order.
+    An item that matches one from a higher-priority stream within DUPLICATE_WINDOW is a second
+    record of the same activity: it is dropped, and fills in any fields the kept item lacks (a
+    Chrome visit's device, say). Matching is one-to-one, so reloading a page five times in
+    Chrome while My Activity recorded one visit keeps four. Items within one stream are never
+    merged: repeats there are real, and compress counts them. Returns the kept items and the
+    number merged away."""
+    seen: dict[tuple[Kind, str, str], list[tuple[float, int]]] = defaultdict(list)  # (ts, index)
     window = DUPLICATE_WINDOW.total_seconds()
     kept: list[Item] = []
     merged = 0
@@ -75,7 +120,7 @@ def merge_duplicates(by_source: list[list[Item]]) -> tuple[list[Item], int]:
             best = nearest[1]
             claimed.add(best)
             kept[best] = kept[best]._replace(
-                **{f: getattr(item, f) for f in Item._fields if getattr(kept[best], f) is None}
+                **{f: getattr(item, f) for f in _FILLABLE if getattr(kept[best], f) is None}
             )
             merged += 1
         for item in fresh:
@@ -98,11 +143,13 @@ def load(
     """Parse and merge the files into chronologically ordered Events, keeping those in
     [since, until). Ids are assigned over the full history before filtering, so an event has
     the same id no matter what range is selected."""
-    by_source: dict[str, list[Item]] = defaultdict(list)
+    streams: dict[tuple[str, str], list[Item]] = defaultdict(list)
     for source, file in files:
-        by_source[source.name].extend(source.parse(file))
+        for item in source.parse(file):
+            streams[source.name, item.product].append(item)
+    order = {s.name: i for i, s in enumerate(sources.SOURCES)}
     items, duplicates = merge_duplicates(
-        [by_source[s.name] for s in sources.SOURCES if s.name in by_source]
+        [streams[k] for k in sorted(streams, key=lambda k: (_product_rank(k[1]), order[k[0]]))]
     )
     items = boilerplate.strip_items(items)
     # Sorting is stable, so AI Mode follow-ups sharing a timestamp keep their order.

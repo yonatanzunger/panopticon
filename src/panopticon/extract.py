@@ -162,13 +162,15 @@ The transcript format:
 The zone is the user's home zone, not necessarily where they were.
 - "--" separates sessions (bursts of activity with gaps of 30+ minutes between them).
 - Each line is "#<id> HH:MM <kind> <text>", optionally followed by "@site" (the site of a \
-visit), "×N" (repeated N times in that session), and "[loc LAT,LON SOURCE]": where Google \
+visit, or the channel of a video), "×N" (repeated N times in that session), and "[loc LAT,LON SOURCE]": where Google \
 recorded the user as being for that event, to about 1km. SOURCE says how Google knew: \
 "device" (the phone's location), "home" or "work" (a saved place), or "past activity" (a \
 guess). A device location is strong evidence of presence; report it, and use it to judge \
 the lines around it.
 - Kinds: S search, S* AI Mode prompt, I image search, V page visit, $ ad click, A app use, \
-P place or business card viewed, N notifications.
+P place or business card viewed, N notifications, W YouTube video watched, W* YouTube Music \
+track played, C comment or live chat message the user posted on YouTube (their own words; \
+"(on <title>)" names the video).
 
 Produce two lists.
 

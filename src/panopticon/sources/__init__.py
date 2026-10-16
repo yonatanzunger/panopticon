@@ -8,10 +8,12 @@ To read a new kind of export, add a module here and list its ``SOURCE`` in ``SOU
 
 import csv
 import json
+import re
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import parse_qs, urlparse
 
 from panopticon.events import Kind
 
@@ -52,12 +54,36 @@ def read_csv(path: Path) -> Iterator[dict[str, str]]:
         yield from csv.DictReader(f)
 
 
+_VIDEO_ID = re.compile(r"^[\w-]{11}$")
+_YOUTUBE_HOSTS = {"www.youtube.com", "youtube.com", "m.youtube.com", "music.youtube.com"}
+
+
+def youtube_video_url(url: str | None) -> str | None:
+    """One canonical URL per YouTube video, whichever form a source recorded it in: watch
+    pages on any YouTube host, youtu.be links, and Shorts. None for anything else."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    video = None
+    if parsed.hostname in _YOUTUBE_HOSTS:
+        if parsed.path == "/watch":
+            video = parse_qs(parsed.query).get("v", [None])[0]
+        elif parsed.path.startswith("/shorts/"):
+            video = parsed.path.removeprefix("/shorts/").split("/")[0]
+    elif parsed.hostname == "youtu.be":
+        video = parsed.path.lstrip("/").split("/")[0]
+    if video and _VIDEO_ID.match(video):
+        return f"https://www.youtube.com/watch?v={video}"
+    return None
+
+
 # Imported last: the source modules use Item and Source from this module.
-from panopticon.sources import chrome, my_activity
+from panopticon.sources import chrome, my_activity, youtube
 
 # In priority order: a file goes to the first source that claims it, and when two sources
-# record the same activity, ingest keeps the earlier source's copy.
-SOURCES: tuple[Source, ...] = (my_activity.SOURCE, chrome.SOURCE)
+# record the same activity, ingest keeps the earlier source's copy. Chrome comes last: the
+# others record the same searches and videos with more context (locations, channels).
+SOURCES: tuple[Source, ...] = (my_activity.SOURCE, youtube.SOURCE, chrome.SOURCE)
 
 
 def claim(path: Path) -> Source | None:
