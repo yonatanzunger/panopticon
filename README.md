@@ -1,26 +1,111 @@
 # Panopticon
 
-Shows people how much their Google activity history reveals about them.
+This is a tool to help understand what and how much your Google activity history reveals about
+you.
 
 Input is a Google Takeout export of **My Activity** (the `Search`, `Ads`, and `AI Mode`
 folders). The local phases run entirely on your machine; the LLM phases send the compressed
 transcript and derived facts to the Claude API (every one has a `--dry-run` that shows exactly
 what would be sent).
 
+**WARNING:** The entire point of this software is to process very sensitive data and make sensitive
+inferences. Only use this on your own data, and very carefully control who has access to this. Do
+not run this, or ever store Google Takeout data, on a machine you do not personally control. The
+data you process will be sent to Claude, so you will have to make a trust decision before using it;
+if someone wants to update this code to allow using other LLMs, including local ones, that would
+probably be a good idea.
+
 ## Running it
 
-Everything lives in one output directory (`out/` by default, gitignored). First `prepare` it
-from a Takeout export, then let `run` do the rest:
+### What you need to begin
+
+This software doesn't come with a nice user interface -- it was hacked up in an afternoon. If
+someone wants to make this nicer to use, that would also be a good idea.
+
+* You need a Google account with data you want to analyze. If you don't already have this, there's
+  no point in running this.
+* You need a Claude API account with [API access configured](https://platform.claude.com/docs/en/get-api-key) and
+  [authenticated](https://platform.claude.com/docs/en/cli-sdks-libraries/cli/authentication). (You can
+  use either the `ant auth login` or `ANTHROPIC_API_KEY` method; either works)
+* You need to install this git repo on your computer, either using
+  `git clone https://github.com/yonatanzunger/panopticon.git` (if you have git and know how to use
+  it) or by downloading https://github.com/yonatanzunger/panopticon/archive/refs/heads/main.zip .
+* If you haven't used Python on your computer before, you'll need to install
+  [uv](https://docs.astral.sh/uv/getting-started/installation/).
+* You'll need to know how to use the appropriate terminal app on your computer to actually run all
+  those commands.
+
+### Get a Google Takeout export
+
+Go to takeout.google.com and create a new export. Start with a "deselect all" and just choose the
+entries you want to explore.
+
+* If you just want to look at your search history and similar activity logs, select "My Activity."
+  Under that, click on "Multiple formats" and request the activity records in JSON (rather than
+  HTML) format.
+* If you want to include your web browsing information, also select "Chrome."
+* If you want to include your location history, also select "Timeline."
+* If you want to include your YouTube video history, also select "YouTube and YouTube Music," then
+  select "All YouTube Data Included." Uncheck "music (library and uploads)" and "videos." Next,
+  check "Multiple Formats" and scroll down to "history;" change that to "JSON."
+
+Then select "next step" and "create export." You'll receive an email when your export is ready,
+usually within minutes but it may take up to a few days. Download the export and unzip it.
+
+### Running the analysis
+
+From the `panopticon` directory, run
 
 ```bash
-uv run panopticon prepare ~/Downloads/Takeout -o out/ --days 120   # bootstrap the directory
-uv run panopticon run out/                                         # extract → … → report
+uv run panopticon run [outdir] -i [takeoutdir] --days 120
 ```
 
+where you replace `[outdir]` with the directory where you want to put your results, and
+`[takeoutdir]` with the name of the unzipped directory of your Takeout files. `--days 120` means to
+analyze the last 120 days of data; you can pick any number you want, or omit this to analyze your
+entire history.
+
+### Looking at your results
+
+In your output directory, you'll find a file called `report.html` -- double-click on it to see a
+summary of what was learned. Other files in that directory will include deeper details.
+
+## Appendix: for developers
+
+### Tests
+
+```bash
+uv run python -m pytest
+```
+
+(`uv run pytest` can fail to start in some virtualenvs; `python -m pytest` always works.)
+
+### The pipeline
+
+| Stage | Module | Command | Status |
+|---|---|---|---|
+| 0. Ingest: Takeout files → `Event`s with stable ids | `ingest.py`, `sources/` | `prepare` | done |
+| 1. Compress: noise removal, sessions, compact transcript | `compress.py` | `prepare` | done |
+| 2. Deterministic features: location fixes → timezone, home, daily rhythm, app usage | `features.py` | `prepare` | done |
+| 3. LLM evidence extraction: place and fact atoms | `extract.py` | `extract` | done |
+| 4. Itinerary solver and re-localization | `itinerary.py` | `itinerary` | done |
+| 5. LLM synthesis of claims (hierarchical when large), with cited evidence | `synthesize.py` | `synthesize` | done |
+| 5b. Enrichment framework (gather external evidence) | `enrich.py` | `enrich` | noop |
+| 6. LLM verification of each claim against its cited lines | `verify.py` | `verify` | done |
+| 7. Final summary from the verified claims | `summarize.py` | `summarize` | done |
+| 8. Report | `report.py` | `report` | done |
+
+Typed objects (`model.py`: `Claim`, `Trip`) are passed between phases in memory and serialized
+to JSON on disk. Everything lives in one output directory (`out/` is gitignored).
+
+### `run` and phase freshness
+
 `run` executes every phase whose code or inputs have changed since it last ran, in order, up
-to `report`, and skips the rest. So after editing a prompt or re-running `prepare`, `run` again
-redoes only what's affected (an LLM phase that re-runs costs money — `run out/ --plan` shows
-what would run without running it). It tracks this in `out/pipeline.json`.
+to `report`, and skips the rest. So after editing a prompt or pointing at a new export, `run`
+again redoes only what's affected. An LLM phase that re-runs costs money, so check first with
+`--plan`. A phase whose upstream re-ran but wrote identical files is skipped, so `--plan` can
+list more than actually runs. The orchestrator is `pipeline.py`; it tracks state in
+`out/pipeline.json`.
 
 ```bash
 uv run panopticon run out/ --plan     # list the phases that are stale; run nothing
@@ -29,45 +114,51 @@ uv run panopticon run out/ --adopt    # mark the current outputs as up-to-date w
 ```
 
 Use `--adopt` on a directory whose phases you ran by hand before `run` existed, so `run` won't
-redo finished work.
+redo finished work. A directory prepared before `prepare` became a phase has no record of its
+export: pass `-i` (and the same range as before) once, and if the events come out the same,
+nothing downstream re-runs.
 
-The phases, in order: `extract` → `itinerary` → `synthesize` → `enrich` → `verify` →
-`summarize` → `report`. (`prepare` is the bootstrap and is run on its own.)
+### Running individual phases
 
-## Individual phases
-
-You can also run any phase on its own — useful for iterating on one stage, passing non-default
+You can run any phase on its own: useful for iterating on one stage, passing non-default
 options (`--model`, `--effort`, `--dry-run`), or inspecting its output. **Running a phase
 directly also updates the run state**, so a later `run` won't redo it. Each phase reads the
 output directory and writes back into it.
 
-### prepare: ingest, compress, features (local)
+#### prepare: ingest, compress, features (local)
 
 ```bash
-uv run panopticon prepare ~/Downloads/Takeout -o out/                 # all history
-uv run panopticon prepare ~/Downloads/Takeout -o out/ --days 120      # the export's last 120 days
-uv run panopticon prepare ~/Downloads/Takeout -o out/ --since 2026-08-01 --until 2026-09-01
+uv run panopticon prepare out/ -i ~/Downloads/Takeout                 # all history
+uv run panopticon prepare out/ -i ~/Downloads/Takeout --days 120      # the export's last 120 days
+uv run panopticon prepare out/ --since 2026-08-01 --until 2026-09-01  # same export, new range
+uv run panopticon prepare out/                                        # re-run with the recorded settings
 ```
 
-- The input can be a Takeout root, its `My Activity` folder, or individual `MyActivity.json`
-  files.
+- `-i` / `--input` can be a Takeout root, any folder inside one, or a single file, and can be
+  repeated. Every file under it that a reader in `sources/` recognizes is read; the rest are
+  ignored. Today that's `MyActivity.json` (from any product's `My Activity` folder).
+- The inputs and range are recorded in `out/inputs.json`. `run` takes the same flags. Passing
+  any of them replaces the recorded range; leaving out `-i` keeps the recorded inputs. The
+  export files are hashed as inputs, so `run` notices if they change.
 - `--since` / `--until` take an ISO date or datetime (UTC if no zone is given); `--until` is
   exclusive. `--days` counts back from `--until`, or from the newest event in the export, so
   repeated runs on one export select the same events.
 - Event ids are assigned over the full history before filtering, so an event has the same id
-  in every subset.
+  in every subset. (Adding a new kind of input changes the history, and so the ids.)
+- To read a new kind of export file, add a module to `sources/` that exports a `SOURCE` (a
+  name, a test for which files it reads, and a parser from a file to `Item`s), and list it in
+  `sources.SOURCES`. `sources` has JSON and CSV readers.
 
 Writes:
 
+- `inputs.json`: the export and range to read
 - `events.jsonl`: every event in the range (stage 0)
 - `transcript.txt`: the compact, session-grouped transcript, localized to the home zone; lines
   with a Google location carry a `[loc lat,lon source]` tag (stage 1)
 - `features.json`: location fixes with zones, home, hour histogram, daily quiet periods, app
   usage (stage 2)
 
-### Stage 3: evidence extraction (Claude API)
-
-Needs Claude API credentials: `ant auth login`, or `ANTHROPIC_API_KEY` in the environment.
+#### extract: evidence extraction (Claude API)
 
 ```bash
 uv run panopticon extract out/ --dry-run      # write the exact prompts to out/chunk_*.txt, estimate cost, send nothing
@@ -94,7 +185,7 @@ Writes:
 - `facts.jsonl`: one fact atom per line, with a stable id (`F<n>`), citing event ids
 - `extract_log.jsonl`: per-chunk stop reason, serving model, token usage, and dropped atoms
 
-### Stage 4: itinerary (local)
+#### itinerary (local)
 
 ```bash
 uv run panopticon itinerary out/
@@ -118,7 +209,7 @@ Writes:
 - `transcript_local.txt`: the transcript re-rendered with each session in the zone where the
   itinerary places the user
 
-### Stage 5: synthesis (Claude API)
+#### synthesize (Claude API)
 
 Run after `extract` and `itinerary` (without an itinerary it still works, but with no trips
 and with home-zone times).
@@ -146,7 +237,7 @@ Writes:
 - `profile.json`: the summary and claims
 - `profile.md`: the same, readable, grouped by category
 
-### enrich (local; noop for now)
+#### enrich (local; noop for now)
 
 ```bash
 uv run panopticon enrich out/
@@ -154,13 +245,13 @@ uv run panopticon enrich out/
 
 - The framework for a phase that gathers external evidence about the subject (e.g. public web
   pages) for verification to weigh. No enrichers are implemented yet, so this writes an empty
-  `enrichment.json`. The design is in the TODO list.
+  `enrichment.json`. The design is in the TODO list below.
 
 Writes:
 
 - `enrichment.json`: `{"enrichers": [...], "findings": [...]}` (currently empty)
 
-### Stage 6: verification (Claude API)
+#### verify (Claude API)
 
 ```bash
 uv run panopticon verify out/ --dry-run   # write the exact prompts to out/verify_prompts.txt, estimate cost, send nothing
@@ -191,7 +282,7 @@ Writes:
   (`status`, `final_claim`, `final_confidence`, `final_about`, `final_sensitivity`). This is
   the main machine-readable output.
 
-### Stage 7: final summary (Claude API)
+#### summarize (Claude API)
 
 ```bash
 uv run panopticon summarize out/ --dry-run    # write the exact prompt to out/summarize_prompt.txt, estimate cost, send nothing
@@ -207,7 +298,7 @@ Writes:
 
 - `summary.json`
 
-### Stage 8: report (local)
+#### report (local)
 
 ```bash
 uv run panopticon report out/                 # writes out/report.html
@@ -226,41 +317,31 @@ uv run panopticon report out/ -o ~/Desktop/my-report.html
 - Uses `verified.json` if present, otherwise the unverified `profile.json`; and the final
   summary from `summary.json` if present, otherwise synthesis's draft, marked as a draft.
   Follows the system light/dark setting.
+- Writing to `-o` somewhere else doesn't update the run state; only the default
+  `report.html` is tracked.
 
-### Tests
+### Notes on the data
 
-```bash
-uv run pytest
-```
+- **Ads** is not ads you clicked. It's activity Google observed through its ad network on
+  third-party sites and apps; its `header` gives the site or app. In **Search**, a visit marked
+  "From Google Ads" *is* an ad click (`Kind.AD_CLICK`).
+- Locations are map-tile centers, labeled by source (`device`, `home`, `work`, ...).
+  They are sparse: in one sample export, only 2015–2018 and 2026 had any.
+- AI Mode items embed whole conversations; each of the user's follow-up prompts becomes its own
+  event, and Google's responses are dropped.
+- Timestamps are UTC throughout; localization happens at render time.
 
-## Pipeline
+### TODO
 
-| Stage | Module | Command | Status |
-|---|---|---|---|
-| 0. Ingest: Takeout JSON → `Event`s with stable ids | `ingest.py` | `prepare` | done |
-| 1. Compress: noise removal, sessions, compact transcript | `compress.py` | `prepare` | done |
-| 2. Deterministic features: location fixes → timezone, home, daily rhythm, app usage | `features.py` | `prepare` | done |
-| 3. LLM evidence extraction: place and fact atoms | `extract.py` | `extract` | done |
-| 4. Itinerary solver and re-localization | `itinerary.py` | `itinerary` | done |
-| 5. LLM synthesis of claims (hierarchical when large), with cited evidence | `synthesize.py` | `synthesize` | done |
-| 5b. Enrichment framework (gather external evidence) | `enrich.py` | `enrich` | noop |
-| 6. LLM verification of each claim against its cited lines | `verify.py` | `verify` | done |
-| 7. Final summary from the verified claims | `summarize.py` | `summarize` | done |
-| 8. Report | `report.py` | `report` | done |
-
-Typed objects (`model.py`: `Claim`, `Trip`) are passed between phases in memory and serialized
-to JSON on disk. The `run` orchestrator (`pipeline.py`) tracks phase freshness in
-`out/pipeline.json`.
-
-## TODO
-
+- **More Takeout sources.** Chrome history, Timeline, and YouTube, as modules in `sources/`.
+  The same activity can appear both in My Activity and in a product's own export, so these
+  will need de-duplication; Timeline's visits span time rather than being instants.
 - **Home that changes over time.** `features.home` picks one home for the whole range, so on a
   long history every earlier residence is treated as travel (or missed). Infer home per period,
   e.g. the dominant overnight location per month, and let the itinerary solver use it.
 - **Web research (the first `enrich` enricher, between `synthesize` and `verify`).** Find public
-  information
-  that supports or contradicts the profile, as a human researcher would, especially to test an
-  identity hypothesis. Agreed design:
+  information that supports or contradicts the profile, as a human researcher would, especially
+  to test an identity hypothesis. Agreed design:
   - Runs before verification, so web findings become evidence the verifier weighs. The
     verifier then records two judgments per claim: what the history alone supports, and what
     the history plus the web supports. That keeps "what your history alone reveals" intact
@@ -287,14 +368,3 @@ to JSON on disk. The `run` orchestrator (`pipeline.py`) tracks phase freshness i
   - Later: an optional loop (research → re-synthesize with findings as context → verify), since
     knowing who someone is changes how their history reads.
 - **Inferability scoring.** For each claim, how much history it takes to infer it.
-
-## Notes on the data
-
-- **Ads** is not ads you clicked. It's activity Google observed through its ad network on
-  third-party sites and apps; its `header` gives the site or app. In **Search**, a visit marked
-  "From Google Ads" *is* an ad click (`Kind.AD_CLICK`).
-- Locations are map-tile centers, labeled by source (`device`, `home`, `work`, ...).
-  They are sparse: in one sample export, only 2015–2018 and 2026 had any.
-- AI Mode items embed whole conversations; each of the user's follow-up prompts becomes its own
-  event, and Google's responses are dropped.
-- Timestamps are UTC throughout; localization happens at render time.

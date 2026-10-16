@@ -7,6 +7,9 @@ output is missing, its module code changed, or an input changed. Because one pha
 are the next phase's inputs, re-running an upstream phase makes every dependent phase stale, so
 `run` refreshes exactly the phases that need it, in order, up to `report`.
 
+The first phase, `prepare`, also reads files outside the directory: the Takeout export named
+in `inputs.json`. Those are hashed as inputs too, so a new export re-runs everything.
+
 This module is pure: it does not run phases itself. The caller passes a map from phase name to
 a callable that runs it, which keeps the dependency graph independent of the CLI.
 """
@@ -18,21 +21,30 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
+from panopticon import prepare
+
 _SRC = Path(__file__).parent
 CONFIG = "pipeline.json"
 
 
 class Phase(NamedTuple):
     name: str
+    # Source files, or packages (every .py under them), relative to this package.
     modules: tuple[str, ...]
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
+    # Input files outside the directory, as a function of the directory.
+    external: Callable[[Path], list[Path]] | None = None
 
 
-# In dependency order. Every stage after `prepare`, which bootstraps the directory from the
-# Takeout export and so is run on its own. `enrich` is the noop enrichment phase; `verify`
-# lists enrichment.json as an input so it re-runs once an enricher produces findings.
+# In dependency order. `enrich` is the noop enrichment phase; `verify` lists enrichment.json as
+# an input so it re-runs once an enricher produces findings.
 PHASES: tuple[Phase, ...] = (
+    Phase("prepare",
+          ("prepare.py", "ingest.py", "sources", "events.py", "compress.py", "features.py"),
+          (prepare.SETTINGS,),
+          ("events.jsonl", "transcript.txt", "features.json"),
+          external=prepare.source_files),
     Phase("extract", ("extract.py", "llm.py", "compress.py"),
           ("events.jsonl", "features.json"),
           ("places.jsonl", "facts.jsonl", "extract_log.jsonl")),
@@ -71,16 +83,20 @@ def _hash_file(path: Path) -> str | None:
 def _code_hash(phase: Phase) -> str:
     h = hashlib.sha256()
     for module in phase.modules:
-        h.update((_hash_file(_SRC / module) or "").encode())
+        path = _SRC / module
+        files = sorted(path.rglob("*.py")) if path.is_dir() else [path]
+        for file in files:
+            h.update((_hash_file(file) or "").encode())
     return h.hexdigest()
 
 
 def signature(phase: Phase, directory: Path) -> dict:
-    """The phase's current code hash and the hash of each of its input files (None if absent)."""
-    return {
-        "code": _code_hash(phase),
-        "inputs": {name: _hash_file(directory / name) for name in phase.inputs},
-    }
+    """The phase's current code hash and the hash of each of its input files (None if absent).
+    External inputs are keyed by absolute path."""
+    inputs = {name: _hash_file(directory / name) for name in phase.inputs}
+    if phase.external:
+        inputs |= {str(path): _hash_file(path) for path in phase.external(directory)}
+    return {"code": _code_hash(phase), "inputs": inputs}
 
 
 def is_stale(phase: Phase, directory: Path, config: dict) -> bool:
@@ -157,7 +173,11 @@ def run_pipeline(
     log: Callable[[str], None] = print,
 ) -> list[Phase]:
     """Run every stale phase in order, recording each phase's signature after it writes its
-    outputs. Returns the phases that ran (or, with plan_only, that would run)."""
+    outputs. Returns the phases that ran (or, with plan_only, that would run).
+
+    The plan assumes every scheduled phase changes its outputs. Running, each phase is checked
+    again just before its turn, so one whose upstream rewrote identical files is skipped: a
+    re-run `prepare` that reproduces the same events costs no LLM phases."""
     config = load_config(directory)
     todo = plan(directory, config, force)
     if not todo:
@@ -166,11 +186,16 @@ def run_pipeline(
     log(("would run: " if plan_only else "will run: ") + ", ".join(p.name for p in todo))
     if plan_only:
         return todo
+    ran: list[Phase] = []
     for phase in todo:
+        if not force and not is_stale(phase, directory, config):
+            log(f"=== {phase.name}: inputs unchanged, skipping ===")
+            continue
         log(f"=== {phase.name} ===")
         runners[phase.name](directory)
         config.setdefault("phases", {})[phase.name] = signature(phase, directory) | {
             "ran_at": datetime.now(UTC).isoformat()
         }
         save_config(directory, config)
-    return todo
+        ran.append(phase)
+    return ran

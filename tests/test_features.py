@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from panopticon.cli import select_range
+from panopticon.prepare import select_range
 from panopticon.events import Event, Kind
 from panopticon.features import (
     LocationFix,

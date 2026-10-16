@@ -26,7 +26,7 @@ class Event(NamedTuple):
     id: int
     # Always UTC; localization happens only at render time, once the itinerary is known.
     ts: datetime
-    # The Takeout product: "Search", "AI Mode", or "Ads". "Ads" is activity Google observed
+    # The Takeout product: "Search", "AI Mode", "Ads", .... "Ads" is activity Google observed
     # through its ad network on third-party sites and apps, not ads the user clicked.
     product: str
     kind: Kind

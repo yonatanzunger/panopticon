@@ -1,8 +1,12 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from panopticon.events import Kind
-from panopticon.ingest import classify, load, parse_row, unwrap_url
+from panopticon.ingest import discover, load
+from panopticon.sources import read_csv
+from panopticon.sources.my_activity import classify, parse_row, unwrap_url
 
 MAP = "https://www.google.com/maps/@?api=1&map_action=map&center=37.383159,-122.095106&zoom=12"
 
@@ -129,11 +133,34 @@ def test_load_ids_are_stable_across_ranges(tmp_path):
     ]
     (tmp_path / "My Activity" / "Search" / "MyActivity.json").write_text(json.dumps(rows))
 
-    everything = load([tmp_path])
+    everything = load(discover([tmp_path]))
     assert [(e.id, e.text) for e in everything] == [(0, "a"), (1, "b"), (2, "c")]
 
-    subset = load([tmp_path], since=datetime(2026, 2, 1, tzinfo=UTC))
+    subset = load(discover([tmp_path]), since=datetime(2026, 2, 1, tzinfo=UTC))
     assert [(e.id, e.text) for e in subset] == [(1, "b"), (2, "c")]
 
-    subset = load([tmp_path], until=datetime(2026, 2, 1, tzinfo=UTC))
+    subset = load(discover([tmp_path]), until=datetime(2026, 2, 1, tzinfo=UTC))
     assert [(e.id, e.text) for e in subset] == [(0, "a")]
+
+
+def test_discover_finds_claimed_files_anywhere_and_skips_the_rest(tmp_path):
+    for folder in ("Search", "YouTube"):
+        (tmp_path / "My Activity" / folder).mkdir(parents=True)
+        (tmp_path / "My Activity" / folder / "MyActivity.json").write_text("[]")
+    (tmp_path / "archive_browser.html").write_text("<html>")
+    found = discover([tmp_path, tmp_path / "My Activity" / "Search"])  # overlapping inputs
+    assert sorted(f.parent.name for _, f in found) == ["Search", "YouTube"]
+    assert {s.name for s, _ in found} == {"my_activity"}
+
+
+def test_discover_rejects_unreadable_or_missing_inputs(tmp_path):
+    (tmp_path / "notes.txt").write_text("hi")
+    with pytest.raises(ValueError):
+        discover([tmp_path / "notes.txt"])
+    with pytest.raises(FileNotFoundError):
+        discover([tmp_path / "nope"])
+
+
+def test_read_csv_strips_byte_order_mark(tmp_path):
+    (tmp_path / "a.csv").write_bytes("\ufeffChannel Id,Title\nUC1,\"Hello, world\"\n".encode())
+    assert list(read_csv(tmp_path / "a.csv")) == [{"Channel Id": "UC1", "Title": "Hello, world"}]
