@@ -1,0 +1,255 @@
+"""Stage 3: LLM evidence extraction. Reads transcript chunks and emits typed evidence atoms.
+
+For now this extracts only place evidence, which feeds the itinerary solver. Each atom cites
+the event ids it is based on, so every later claim can be traced back to source rows.
+"""
+
+import json
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, tzinfo
+from pathlib import Path
+from typing import Literal, NamedTuple
+
+import anthropic
+from pydantic import BaseModel, ConfigDict, Field
+
+from panopticon.compress import Session, render
+from panopticon.features import Home, timezone_at
+from panopticon.progress import Progress
+
+DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_EFFORT = "medium"
+# Roughly 60k tokens of transcript per request: big enough to see a whole trip in context,
+# small enough to leave the model room to be thorough.
+DEFAULT_CHUNK_CHARS = 240_000
+_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+
+class Flight(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    number: str | None = Field(description="Airline code and number, e.g. 'AA 917'.")
+    origin: str | None = Field(description="Origin airport IATA code, if known.")
+    destination: str | None = Field(description="Destination airport IATA code, if known.")
+    date: str | None = Field(description="Departure date as YYYY-MM-DD, if known.")
+
+
+class PlaceEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_ids: list[int] = Field(
+        description="The #ids of the transcript lines this evidence rests on, exactly as shown."
+    )
+    place: str = Field(
+        description="The place, as specific as the evidence supports: 'Lima, Peru', "
+        "'Venice, Los Angeles, CA', 'Denver International Airport'."
+    )
+    region: str = Field(
+        description="The city or metro area the place is in, in a consistent form: "
+        "'Lima, Peru', 'Boulder, CO', 'Los Angeles, CA'. For an airport, the city it serves."
+    )
+    lat: float = Field(description="Approximate latitude of the place.")
+    lon: float = Field(description="Approximate longitude of the place.")
+    signal: Literal[
+        "flight",
+        "lodging",
+        "local_search",
+        "transit",
+        "place_card",
+        "weather",
+        "time_query",
+        "local_service",
+        "event",
+        "other",
+    ]
+    relation: Literal["present", "in_transit", "planning", "remote_interest"] = Field(
+        description="present: suggests the user was physically there at the time of the "
+        "events. in_transit: traveling to or from it at the time. planning: researching a "
+        "future visit. remote_interest: interest in the place with no sign of being there."
+    )
+    strength: Literal["strong", "moderate", "weak"]
+    starts: str | None = Field(
+        description="If the evidence names when the user will be or was there (a hotel "
+        "check-in, a flight date), that date as YYYY-MM-DD. Otherwise null."
+    )
+    ends: str | None = Field(description="The matching end date (e.g. check-out), or null.")
+    flight: Flight | None
+    rationale: str = Field(description="One sentence: why this evidence points to this place.")
+
+
+class PlaceExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence: list[PlaceEvidence]
+
+
+SYSTEM_PROMPT = """\
+You are analyzing one person's Google activity history to reconstruct where they physically \
+were over time. This is for a privacy tool that shows people how much their own history \
+reveals, so be thorough: the point is to find every signal an observer could use.
+
+The transcript format:
+- "## YYYY-MM-DD Day [Zone]" starts a day; times on the lines below are local to that zone. \
+The zone is the user's home zone, not necessarily where they were.
+- "--" separates sessions (bursts of activity with gaps of 30+ minutes between them).
+- Each line is "#<id> HH:MM <kind> <text>", optionally followed by "@site" (the site of a \
+visit), "×N" (repeated N times in that session), and "[loc LAT,LON SOURCE]": where Google \
+recorded the user as being for that event, to about 1km. SOURCE says how Google knew: \
+"device" (the phone's location), "home" or "work" (a saved place), or "past activity" (a \
+guess). A device location is strong evidence of presence; report it, and use it to judge \
+the lines around it.
+- Kinds: S search, S* AI Mode prompt, I image search, V page visit, $ ad click, A app use, \
+P place or business card viewed, N notifications.
+
+Extract every piece of evidence about where the user was, was going, or was planning to go. \
+Strong signals include flight numbers and airline or airport activity, hotel and rental \
+searches with dates, "near me" and local-business searches, local transit schedules, place \
+cards, and sudden clusters of searches about one locale. Weaker signals include weather and \
+current-time queries, which people often run for places they are not in. Use the user's \
+home location to tell ordinary local life (which you should not report) from evidence of \
+being elsewhere, but do report anything that marks a departure or return home.
+
+Be precise about relation: a hotel search for future dates is planning, even when it names \
+dates; the same city's UV index searched on the day is present. For travel (in_transit, or \
+planning a trip), the place is always the destination, never the origin, even when the \
+user is leaving home: record the origin in the flight fields or the rationale. Cite the exact #ids. Give \
+approximate coordinates for every place: a city center is fine when nothing more specific \
+is known. Group lines into one evidence item only when they are about the same place and \
+the same moment; otherwise report them separately.\
+"""
+
+
+class Chunk(NamedTuple):
+    index: int
+    start: datetime
+    end: datetime
+    text: str
+    event_ids: frozenset[int]
+
+
+def make_chunks(
+    groups: list[list[Session]], tz_at: Callable[[datetime], tzinfo]
+) -> list[Chunk]:
+    return [
+        Chunk(
+            index=i,
+            start=group[0].start,
+            end=group[-1].end,
+            text=render(group, tz_at),
+            event_ids=frozenset(line.event.id for s in group for line in s.lines),
+        )
+        for i, group in enumerate(groups)
+    ]
+
+
+def user_prompt(chunk: Chunk, home: Home | None) -> str:
+    where = (
+        f"The user's home is near {home.lat}, {home.lon} ({home.tz})."
+        if home
+        else "The user's home location is unknown."
+    )
+    return f"{where}\n\n<transcript>\n{chunk.text}</transcript>"
+
+
+class ChunkResult(NamedTuple):
+    chunk: int
+    evidence: list[dict]
+    stop_reason: str | None
+    model: str | None
+    usage: dict
+    # Atoms dropped because they cited no ids that exist in this chunk.
+    dropped: int
+
+
+def extract_places(
+    client: anthropic.Anthropic,
+    chunk: Chunk,
+    home: Home | None,
+    model: str = DEFAULT_MODEL,
+    effort: str = DEFAULT_EFFORT,
+    on_output: Callable[[int], None] | None = None,
+) -> ChunkResult:
+    """Extract place evidence from one chunk. on_output, if given, is called with the number
+    of output characters received so far as the response streams in."""
+    with client.beta.messages.stream(
+        model=model,
+        max_tokens=64_000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt(chunk, home)}],
+        output_config={"effort": effort},
+        output_format=PlaceExtraction,
+        betas=[_FALLBACK_BETA],
+        fallbacks="default",
+    ) as stream:
+        received = 0
+        for text in stream.text_stream:
+            received += len(text)
+            if on_output:
+                on_output(received)
+        message = stream.get_final_message()
+
+    usage = {
+        "input_tokens": message.usage.input_tokens,
+        "output_tokens": message.usage.output_tokens,
+    }
+    if message.stop_reason in ("refusal", "max_tokens") or message.parsed_output is None:
+        return ChunkResult(chunk.index, [], message.stop_reason, message.model, usage, 0)
+
+    evidence: list[dict] = []
+    dropped = 0
+    for atom in message.parsed_output.evidence:
+        ids = [i for i in atom.event_ids if i in chunk.event_ids]
+        if not ids:
+            dropped += 1
+            continue
+        evidence.append(
+            atom.model_dump()
+            | {"event_ids": ids, "tz": timezone_at(atom.lat, atom.lon), "chunk": chunk.index}
+        )
+    return ChunkResult(
+        chunk.index, evidence, message.stop_reason, message.model, usage, dropped
+    )
+
+
+def run(
+    chunks: list[Chunk],
+    home: Home | None,
+    out: Path,
+    model: str = DEFAULT_MODEL,
+    effort: str = DEFAULT_EFFORT,
+    concurrency: int = 4,
+) -> list[ChunkResult]:
+    """Extract place evidence from every chunk, writing atoms to out/places.jsonl and a
+    per-chunk log to out/extract_log.jsonl."""
+    client = anthropic.Anthropic()
+
+    def one(chunk: Chunk) -> ChunkResult:
+        label = f"chunk {chunk.index} ({chunk.start:%Y-%m-%d}..{chunk.end:%Y-%m-%d})"
+        progress.start(chunk.index, label)
+        result = extract_places(
+            client, chunk, home, model, effort,
+            on_output=lambda chars: progress.update(chunk.index, chars),
+        )
+        progress.finish(
+            chunk.index,
+            f"{len(result.evidence)} atoms, stop={result.stop_reason}, model={result.model}, "
+            f"in={result.usage['input_tokens']:,} out={result.usage['output_tokens']:,} tokens",
+        )
+        return result
+
+    with (
+        Progress("extract", total=len(chunks)) as progress,
+        ThreadPoolExecutor(max_workers=concurrency) as pool,
+    ):
+        results = sorted(pool.map(one, chunks), key=lambda r: r.chunk)
+
+    with open(out / "places.jsonl", "w", encoding="utf8") as f:
+        for result in results:
+            for atom in result.evidence:
+                f.write(json.dumps(atom, ensure_ascii=False) + "\n")
+    with open(out / "extract_log.jsonl", "w", encoding="utf8") as f:
+        for result in results:
+            log = result._asdict() | {"evidence": len(result.evidence)}
+            f.write(json.dumps(log) + "\n")
+    return results

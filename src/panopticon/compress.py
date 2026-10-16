@@ -138,6 +138,43 @@ def _site(event: Event) -> str:
     return f" @{host}" if host else ""
 
 
+def chunk_sessions(
+    sessions: list[Session],
+    max_chars: int,
+    tz_at: Callable[[datetime], tzinfo] = lambda _: UTC,
+) -> list[list[Session]]:
+    """Split sessions into chunks whose rendered size stays under max_chars, breaking only at
+    local day boundaries so that a day's context is never split. A single day larger than
+    max_chars becomes its own oversized chunk rather than being cut."""
+    days: list[list[Session]] = []
+    for session in sessions:
+        day = session.start.astimezone(tz_at(session.start)).date()
+        if days and days[-1][0].start.astimezone(tz_at(days[-1][0].start)).date() == day:
+            days[-1].append(session)
+        else:
+            days.append([session])
+
+    chunks: list[list[Session]] = []
+    size = 0
+    for day_sessions in days:
+        day_size = len(render(day_sessions, tz_at))
+        if chunks and size + day_size <= max_chars:
+            chunks[-1].extend(day_sessions)
+            size += day_size
+        else:
+            chunks.append(list(day_sessions))
+            size = day_size
+    return chunks
+
+
+def _loc(event: Event) -> str:
+    """Google's recorded location for the event, to about 1km, and how it was determined."""
+    if event.lat is None or event.lon is None:
+        return ""
+    source = f" {event.loc_source}" if event.loc_source else ""
+    return f" [loc {event.lat:.2f},{event.lon:.2f}{source}]"
+
+
 def _code(event: Event) -> str:
     code = _KIND_CODES[event.kind]
     return code + "*" if event.product == "AI Mode" else code
@@ -149,7 +186,7 @@ def render(
     """Render sessions as a compact transcript, localizing each session with tz_at(start).
 
     Format: a header line per local day (and whenever the zone changes), then one line per item:
-        #<event id> HH:MM <kind code> <text> [×count]
+        #<event id> HH:MM <kind code> <text> [@site] [×count] [[loc lat,lon source]]
     Kind codes: S search (S* = AI Mode), I image search, V visit, $ ad click, A app use,
     P place card, N notifications. Visits show their site after the title, as "<title> @site".
     """
@@ -166,5 +203,5 @@ def render(
             e = line.event
             local = e.ts.astimezone(tz).strftime("%H:%M")
             count = f" ×{line.count}" if line.count > 1 else ""
-            out.append(f"#{e.id} {local} {_code(e)} {_display(e)}{_site(e)}{count}")
+            out.append(f"#{e.id} {local} {_code(e)} {_display(e)}{_site(e)}{count}{_loc(e)}")
     return "\n".join(out).lstrip() + "\n"
