@@ -44,10 +44,11 @@ entries you want to explore.
   Under that, click on "Multiple formats" and request the activity records in JSON (rather than
   HTML) format.
 * If you want to include your web browsing information, also select "Chrome."
-* If you want to include your location history, also select "Timeline."
 * If you want to include your YouTube video history, also select "YouTube and YouTube Music," then
   select "All YouTube Data Included." Uncheck "music (library and uploads)" and "videos." Next,
   check "Multiple Formats" and scroll down to "history;" change that to "JSON."
+* TODO: Location history is not yet supported; in the future, we should add support for that. You
+  would get the data by also selecting "Timeline."
 
 Then select "next step" and "create export." You'll receive an email when your export is ready,
 usually within minutes but it may take up to a few days. Download the export and unzip it.
